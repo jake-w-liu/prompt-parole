@@ -1702,6 +1702,11 @@ enum CommandKind {
         #[arg(long, value_enum, default_value = "start")]
         action: GuardAgentAction,
     },
+    #[command(hide = true)]
+    GuardWatchdog {
+        #[arg(long, default_value_t = 5)]
+        interval_seconds: u64,
+    },
     Install {
         #[arg(long)]
         password_stdin: bool,
@@ -1924,6 +1929,9 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
                 }
             }
             Ok(0)
+        }
+        CommandKind::GuardWatchdog { interval_seconds } => {
+            run_guard_watchdog(core.clone(), interval_seconds)
         }
         CommandKind::Install {
             password_stdin,
@@ -2234,35 +2242,105 @@ fn foreground_target() -> Result<ForegroundTarget, String> {
 }
 
 fn input_guard_running() -> bool {
-    !guard_process_pids().is_empty()
+    !prompt_parole_process_pids("guard").is_empty()
 }
 
 const GUARD_AGENT_LABEL: &str = "com.prompt-parole.guard";
+const GUARD_WATCHDOG_LABEL: &str = "com.prompt-parole.guard-watchdog";
 
 fn start_guard_agent(core: &ParoleCore) -> Result<(), String> {
-    if input_guard_running() {
-        return Ok(());
-    }
     #[cfg(target_os = "macos")]
     {
-        let plist = guard_agent_plist_path()?;
-        write_guard_agent_plist(core, &plist)?;
-        let domain = launchctl_domain()?;
-        let target = launchctl_target(&domain);
-        let _ = run_launchctl(&["bootout", &target]);
-        run_launchctl(&["bootstrap", &domain, plist.to_string_lossy().as_ref()])?;
-        run_launchctl(&["kickstart", "-k", &target])?;
-        thread::sleep(StdDuration::from_millis(900));
-        if input_guard_running() {
-            return Ok(());
+        if !input_guard_running() {
+            start_guard_once(core)?;
         }
-        let _ = run_launchctl(&["bootout", &target]);
-        start_terminal_guard()
+        start_guard_watchdog_agent(core)
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = core;
         Err("Input Guard agent is currently implemented only for macOS.".to_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_guard_once(core: &ParoleCore) -> Result<(), String> {
+    {
+        let plist = guard_agent_plist_path()?;
+        write_guard_agent_plist(core, &plist)?;
+        let domain = launchctl_domain()?;
+        let target = launchctl_target(&domain, GUARD_AGENT_LABEL);
+        let _ = run_launchctl(&["bootout", &target]);
+        match run_launchctl(&["bootstrap", &domain, plist.to_string_lossy().as_ref()])
+            .and_then(|_| run_launchctl(&["kickstart", "-k", &target]))
+        {
+            Ok(()) => {
+                thread::sleep(StdDuration::from_millis(900));
+                if input_guard_running() {
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                eprintln!("prompt-parole: direct launchd guard unavailable: {err}");
+                thread::sleep(StdDuration::from_millis(900));
+                if input_guard_running() {
+                    return Ok(());
+                }
+            }
+        }
+        let _ = run_launchctl(&["bootout", &target]);
+        start_terminal_guard()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_guard_once(core: &ParoleCore) -> Result<(), String> {
+    let _ = core;
+    Err("Input Guard agent is currently implemented only for macOS.".to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn start_guard_watchdog_agent(core: &ParoleCore) -> Result<(), String> {
+    if guard_watchdog_running() {
+        return Ok(());
+    }
+    let plist = guard_watchdog_plist_path()?;
+    write_guard_watchdog_plist(core, &plist)?;
+    let domain = launchctl_domain()?;
+    let target = launchctl_target(&domain, GUARD_WATCHDOG_LABEL);
+    let _ = run_launchctl(&["bootout", &target]);
+    run_launchctl(&["bootstrap", &domain, plist.to_string_lossy().as_ref()])?;
+    run_launchctl(&["kickstart", "-k", &target])?;
+    thread::sleep(StdDuration::from_millis(600));
+    if guard_watchdog_running() {
+        Ok(())
+    } else {
+        Err("Input guard watchdog did not stay running.".to_owned())
+    }
+}
+
+fn guard_watchdog_running() -> bool {
+    !prompt_parole_process_pids("guard-watchdog").is_empty()
+}
+
+fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, String> {
+    if interval_seconds == 0 {
+        return Err("interval-seconds must be positive.".to_owned());
+    }
+    println!("Prompt Parole guard watchdog is running.");
+    loop {
+        let locked = core
+            .is_configured()
+            .then(|| core.decision().map(|decision| !decision.allowed))
+            .transpose()?
+            .unwrap_or(false);
+        if locked
+            && !input_guard_running()
+            && let Err(err) = start_guard_once(&core)
+        {
+            eprintln!("prompt-parole watchdog: could not start input guard: {err}");
+        }
+        thread::sleep(StdDuration::from_secs(interval_seconds));
     }
 }
 
@@ -2301,15 +2379,13 @@ fn stop_guard_agent(core: &ParoleCore) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let _ = core;
-        let target = launchctl_target(&launchctl_domain()?);
-        let result = run_launchctl(&["bootout", &target]).or_else(|err| {
-            if err.contains("No such process") || err.contains("Could not find service") {
-                Ok(())
-            } else {
-                Err(err)
-            }
-        });
+        let domain = launchctl_domain()?;
+        let guard_target = launchctl_target(&domain, GUARD_AGENT_LABEL);
+        let watchdog_target = launchctl_target(&domain, GUARD_WATCHDOG_LABEL);
+        let result = stop_launchctl_target(&guard_target)
+            .and_then(|_| stop_launchctl_target(&watchdog_target));
         stop_guard_processes();
+        stop_guard_watchdog_processes();
         result
     }
     #[cfg(not(target_os = "macos"))]
@@ -2320,12 +2396,18 @@ fn stop_guard_agent(core: &ParoleCore) -> Result<(), String> {
 }
 
 fn stop_guard_processes() {
-    for pid in guard_process_pids() {
+    for pid in prompt_parole_process_pids("guard") {
         let _ = Command::new("kill").arg(pid.to_string()).status();
     }
 }
 
-fn guard_process_pids() -> Vec<u32> {
+fn stop_guard_watchdog_processes() {
+    for pid in prompt_parole_process_pids("guard-watchdog") {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+fn prompt_parole_process_pids(command_arg: &str) -> Vec<u32> {
     let Ok(output) = Command::new("ps").args(["-axo", "pid=,args="]).output() else {
         return Vec::new();
     };
@@ -2335,11 +2417,11 @@ fn guard_process_pids() -> Vec<u32> {
     let self_pid = std::process::id().to_string();
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| parse_guard_process_line(line, &self_pid))
+        .filter_map(|line| parse_prompt_parole_process_line(line, &self_pid, command_arg))
         .collect()
 }
 
-fn parse_guard_process_line(line: &str, self_pid: &str) -> Option<u32> {
+fn parse_prompt_parole_process_line(line: &str, self_pid: &str, command_arg: &str) -> Option<u32> {
     let mut parts = line.trim_start().splitn(2, char::is_whitespace);
     let pid = parts.next()?;
     if pid == self_pid {
@@ -2353,21 +2435,49 @@ fn parse_guard_process_line(line: &str, self_pid: &str) -> Option<u32> {
         return None;
     }
     arg_parts
-        .any(|arg| arg == "guard")
+        .any(|arg| arg == command_arg)
         .then(|| pid.parse().ok())?
 }
 
 fn guard_agent_plist_path() -> Result<PathBuf, String> {
+    launch_agent_plist_path(GUARD_AGENT_LABEL)
+}
+
+fn guard_watchdog_plist_path() -> Result<PathBuf, String> {
+    launch_agent_plist_path(GUARD_WATCHDOG_LABEL)
+}
+
+fn launch_agent_plist_path(label: &str) -> Result<PathBuf, String> {
     dirs::home_dir()
         .map(|home| {
             home.join("Library")
                 .join("LaunchAgents")
-                .join(format!("{GUARD_AGENT_LABEL}.plist"))
+                .join(format!("{label}.plist"))
         })
         .ok_or_else(|| "Could not find home directory.".to_owned())
 }
 
 fn write_guard_agent_plist(core: &ParoleCore, path: &Path) -> Result<(), String> {
+    write_prompt_parole_agent_plist(core, path, GUARD_AGENT_LABEL, &["guard"], "guard")
+}
+
+fn write_guard_watchdog_plist(core: &ParoleCore, path: &Path) -> Result<(), String> {
+    write_prompt_parole_agent_plist(
+        core,
+        path,
+        GUARD_WATCHDOG_LABEL,
+        &["guard-watchdog"],
+        "guard-watchdog",
+    )
+}
+
+fn write_prompt_parole_agent_plist(
+    core: &ParoleCore,
+    path: &Path,
+    label: &str,
+    args: &[&str],
+    log_stem: &str,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory.", path.display()))?;
@@ -2375,14 +2485,25 @@ fn write_guard_agent_plist(core: &ParoleCore, path: &Path) -> Result<(), String>
         .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
     ensure_private_dir(&core.app_dir)?;
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("prompt-parole"));
-    let log = core.app_dir.join("guard.log");
-    let err = core.app_dir.join("guard.err.log");
-    let plist = guard_agent_plist(&exe, &log, &err);
+    let log = core.app_dir.join(format!("{log_stem}.log"));
+    let err = core.app_dir.join(format!("{log_stem}.err.log"));
+    let plist = launch_agent_plist(label, &exe, args, &log, &err);
     fs::write(path, plist).map_err(|err| format!("Could not write {}: {err}", path.display()))?;
     Ok(())
 }
 
-fn guard_agent_plist(exe: &Path, stdout: &Path, stderr: &Path) -> String {
+fn launch_agent_plist(
+    label: &str,
+    exe: &Path,
+    args: &[&str],
+    stdout: &Path,
+    stderr: &Path,
+) -> String {
+    let arg_xml = args
+        .iter()
+        .map(|arg| format!("    <string>{}</string>", xml_escape(arg)))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2393,7 +2514,7 @@ fn guard_agent_plist(exe: &Path, stdout: &Path, stderr: &Path) -> String {
   <key>ProgramArguments</key>
   <array>
     <string>{exe}</string>
-    <string>guard</string>
+{arg_xml}
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -2406,8 +2527,9 @@ fn guard_agent_plist(exe: &Path, stdout: &Path, stderr: &Path) -> String {
 </dict>
 </plist>
 "#,
-        label = GUARD_AGENT_LABEL,
+        label = xml_escape(label),
         exe = xml_escape(&exe.to_string_lossy()),
+        arg_xml = arg_xml,
         stdout = xml_escape(&stdout.to_string_lossy()),
         stderr = xml_escape(&stderr.to_string_lossy())
     )
@@ -2436,8 +2558,21 @@ fn launchctl_domain() -> Result<String, String> {
     ))
 }
 
-fn launchctl_target(domain: &str) -> String {
-    format!("{domain}/{GUARD_AGENT_LABEL}")
+fn launchctl_target(domain: &str, label: &str) -> String {
+    format!("{domain}/{label}")
+}
+
+fn stop_launchctl_target(target: &str) -> Result<(), String> {
+    run_launchctl(&["bootout", target]).or_else(|err| {
+        if err.contains("No such process")
+            || err.contains("Could not find service")
+            || err.contains("service not found")
+        {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    })
 }
 
 fn run_launchctl(args: &[&str]) -> Result<(), String> {
@@ -3440,8 +3575,10 @@ mod tests {
 
     #[test]
     fn guard_agent_plist_escapes_paths_and_keeps_label() {
-        let plist = guard_agent_plist(
+        let plist = launch_agent_plist(
+            GUARD_AGENT_LABEL,
             Path::new("/tmp/prompt&parole"),
+            &["guard"],
             Path::new("/tmp/out<log>"),
             Path::new("/tmp/err\"log\""),
         );
@@ -3450,6 +3587,21 @@ mod tests {
         assert!(plist.contains("<string>/tmp/prompt&amp;parole</string>"));
         assert!(plist.contains("<string>/tmp/out&lt;log&gt;</string>"));
         assert!(plist.contains("<string>/tmp/err&quot;log&quot;</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn guard_watchdog_plist_runs_watchdog_command() {
+        let plist = launch_agent_plist(
+            GUARD_WATCHDOG_LABEL,
+            Path::new("/tmp/prompt-parole"),
+            &["guard-watchdog"],
+            Path::new("/tmp/watchdog.log"),
+            Path::new("/tmp/watchdog.err.log"),
+        );
+
+        assert!(plist.contains("<string>com.prompt-parole.guard-watchdog</string>"));
+        assert!(plist.contains("<string>guard-watchdog</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
     }
 
@@ -3480,26 +3632,52 @@ mod tests {
     #[test]
     fn guard_process_parser_matches_only_real_guard_command() {
         assert_eq!(
-            parse_guard_process_line("123 /Users/jake/.local/bin/prompt-parole guard", "999"),
+            parse_prompt_parole_process_line(
+                "123 /Users/jake/.local/bin/prompt-parole guard",
+                "999",
+                "guard"
+            ),
             Some(123)
         );
         assert_eq!(
-            parse_guard_process_line(
+            parse_prompt_parole_process_line(
                 "124 /Users/jake/.local/bin/prompt-parole guard-agent --action stop",
-                "999"
+                "999",
+                "guard"
             ),
             None
         );
         assert_eq!(
-            parse_guard_process_line(
+            parse_prompt_parole_process_line(
                 "125 /bin/zsh -c /Users/jake/.local/bin/prompt-parole guard",
-                "999"
+                "999",
+                "guard"
             ),
             None
         );
         assert_eq!(
-            parse_guard_process_line("126 /Users/jake/.local/bin/prompt-parole guard", "126"),
+            parse_prompt_parole_process_line(
+                "126 /Users/jake/.local/bin/prompt-parole guard",
+                "126",
+                "guard"
+            ),
             None
+        );
+        assert_eq!(
+            parse_prompt_parole_process_line(
+                "127 /Users/jake/.local/bin/prompt-parole guard-watchdog",
+                "999",
+                "guard"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_prompt_parole_process_line(
+                "128 /Users/jake/.local/bin/prompt-parole guard-watchdog",
+                "999",
+                "guard-watchdog"
+            ),
+            Some(128)
         );
     }
 

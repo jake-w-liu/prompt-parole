@@ -89,6 +89,7 @@ prompt-parole guard
 prompt-parole guard --once --json
 prompt-parole guard-agent --action start
 prompt-parole guard-agent --action stop
+prompt-parole guard-agent --action status
 prompt-parole gui
 ```
 
@@ -162,9 +163,11 @@ That means a session started at 6:30 PM should block its next prompt after a
 7:00 PM curfew while still showing the output that already exists.
 
 Already-running sessions that predate hook installation cannot be retroactively
-forced to load a hook by editing a config file. Reopen Claude Code or Codex
-through the protected launcher after installation. That is the path that blocks
-new prompts without hiding ongoing results.
+forced to load a hook by editing a config file. The Input Guard below is the
+current-window layer for those sessions: it blocks prompt-entry keys in the
+focused Codex/Claude Terminal tab while output remains visible. Reopen Claude
+Code or Codex through the protected launcher after installation to add hook and
+launcher protection to future sessions too.
 
 Codex also requires non-managed command hooks to be trusted before they run.
 Prompt Parole's Codex launcher wrapper starts Codex with hook trust bypass for
@@ -192,10 +195,12 @@ For daily use, start the durable macOS LaunchAgent with:
 prompt-parole guard-agent --action start
 ```
 
-The GUI's **Start Input Guard** button uses the same LaunchAgent path. If macOS
-allows the guard from an interactive Terminal but denies the LaunchAgent event
-tap, Prompt Parole falls back to a visible Terminal guard process instead of
-silently pretending the guard is active.
+The GUI's **Start Input Guard** button uses the same path. It installs a small
+watchdog LaunchAgent plus the keyboard guard. If macOS allows the guard from an
+interactive Terminal but denies the direct LaunchAgent event tap, Prompt Parole
+falls back to a visible Terminal guard process. During a locked period, the
+watchdog restarts that guard if it disappears, so a closed or crashed guard does
+not silently reopen prompting.
 
 ## Protection Layers
 
