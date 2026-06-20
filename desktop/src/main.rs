@@ -12,6 +12,7 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 const PASSWORD_ACTIONS: [&str; 6] = [
@@ -673,6 +674,16 @@ struct PasswordFields {
     unlock: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProtectionStatus {
+    codex_hook: bool,
+    claude_hook: bool,
+    codex_launcher: bool,
+    claude_launcher: bool,
+    codex_path_uses_launcher: bool,
+    claude_path_uses_launcher: bool,
+}
+
 struct PromptParoleApp {
     core: ParoleCore,
     app_dir: PathBuf,
@@ -688,6 +699,7 @@ struct PromptParoleApp {
     unlock_request_minutes: i64,
     password_actions: Vec<String>,
     generated_password: String,
+    protection: ProtectionStatus,
 }
 
 impl PromptParoleApp {
@@ -714,6 +726,7 @@ impl PromptParoleApp {
                 .map(|value| (*value).to_owned())
                 .collect(),
             generated_password: String::new(),
+            protection: ProtectionStatus::default(),
         };
         app.reload();
         app
@@ -736,6 +749,7 @@ impl PromptParoleApp {
                 .collect()
         };
         self.status = self.core.status().ok();
+        self.protection = protection_status();
         self.status_line = match (&self.status, self.configured) {
             (_, false) => "Not configured".to_owned(),
             (Some(status), _) if status.allowed => format!("Allowed: {}", status.reason),
@@ -848,6 +862,37 @@ impl PromptParoleApp {
         }
     }
 
+    fn install_protection(&mut self) {
+        self.error.clear();
+        if let Err(err) = self.core.assert_password(&self.passwords.current) {
+            self.error = err;
+            return;
+        }
+        let mut installed = 0;
+        for target in ["claude", "codex"] {
+            let path = match target_path(target, None) {
+                Ok(path) => path,
+                Err(err) => {
+                    self.error = err;
+                    return;
+                }
+            };
+            let command = default_hook_command(&target_agent(target));
+            if let Err(err) = install_json_hook(&path, &command, "Checking Prompt Parole curfew") {
+                self.error = err;
+                return;
+            }
+            if let Err(err) = install_launcher(target, None) {
+                self.error = err;
+                return;
+            }
+            installed += 1;
+        }
+        self.passwords.current.clear();
+        self.status_line = format!("Installed hooks and launchers for {installed} tools.");
+        self.reload();
+    }
+
     fn window_values(&self) -> Result<Vec<String>, String> {
         if self.windows.is_empty() {
             return Err("At least one lock window is required.".to_owned());
@@ -900,7 +945,7 @@ impl eframe::App for PromptParoleApp {
                 ui.add_space(14.0);
 
                 if self.configured {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.configured_ui(ui));
+                    self.configured_ui(ui);
                 } else {
                     egui::ScrollArea::vertical().show(ui, |ui| self.setup_ui(ui));
                 }
@@ -933,70 +978,106 @@ impl PromptParoleApp {
     }
 
     fn configured_ui(&mut self, ui: &mut egui::Ui) {
-        section_frame().show(ui, |ui| {
-            section_title(ui, "Settings");
-            form_grid(ui, "current-password", |ui| {
-                password_editor(ui, "Current password", &mut self.passwords.current);
-            });
-            settings_editor(
-                ui,
-                &mut self.timezone,
-                &mut self.unlock_duration_minutes,
-                &mut self.windows,
-                &mut self.password_actions,
-            );
-            ui.add_space(10.0);
-            if primary_button(ui, "Save Settings").clicked() {
-                self.save_settings();
-            }
-        });
+        let column_height = ui.available_height();
+        ui.columns(2, |columns| {
+            egui::ScrollArea::vertical()
+                .id_salt("schedule-settings-column")
+                .max_height(column_height)
+                .show(&mut columns[0], |ui| {
+                    section_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        section_title(ui, "Schedule & Settings");
+                        form_grid(ui, "current-password", |ui| {
+                            password_editor(ui, "Current password", &mut self.passwords.current);
+                        });
+                        settings_editor(
+                            ui,
+                            &mut self.timezone,
+                            &mut self.unlock_duration_minutes,
+                            &mut self.windows,
+                            &mut self.password_actions,
+                        );
+                        ui.add_space(10.0);
+                        if primary_button(ui, "Save Settings").clicked() {
+                            self.save_settings();
+                        }
+                    });
+                });
 
-        ui.add_space(14.0);
-        section_frame().show(ui, |ui| {
-            section_title(ui, "Temporary Unlock");
-            form_grid(ui, "unlock-form", |ui| {
-                password_editor(ui, "Password", &mut self.passwords.unlock);
-                ui.label("Duration");
-                ui.add(
-                    egui::DragValue::new(&mut self.unlock_request_minutes)
-                        .range(1..=1440)
-                        .suffix(" min"),
-                );
-                ui.end_row();
-            });
-            if primary_button(ui, "Unlock Temporarily").clicked() {
-                self.unlock();
-            }
+            egui::ScrollArea::vertical()
+                .id_salt("actions-column")
+                .max_height(column_height)
+                .show(&mut columns[1], |ui| {
+                    section_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        section_title(ui, "Now");
+                        if let Some(status) = &self.status {
+                            status_summary(ui, status);
+                        }
+                        ui.add_space(10.0);
+                        protection_summary(ui, &self.protection);
+                        ui.add_space(10.0);
+                        if secondary_button(ui, "Install Hooks & Launchers").clicked() {
+                            self.install_protection();
+                        }
+                        meta_label(ui, "Reopen Codex or Claude through the protected launcher after installing. Output remains visible; new prompts are blocked.");
+                    });
 
-            if let Some(status) = &self.status {
-                if let Some(value) = &status.locked_until {
-                    meta_label(ui, format!("Scheduled lock ends: {value}"));
-                }
-                if let Some(value) = &status.unlock_expires_at {
-                    meta_label(ui, format!("Temporary unlock expires: {value}"));
-                }
-            }
-        });
+                    ui.add_space(14.0);
+                    section_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        section_title(ui, "Temporary Unlock");
+                        form_grid(ui, "unlock-form", |ui| {
+                            password_editor(ui, "Password", &mut self.passwords.unlock);
+                            ui.label("Duration");
+                            ui.add(
+                                egui::DragValue::new(&mut self.unlock_request_minutes)
+                                    .range(1..=1440)
+                                    .suffix(" min"),
+                            );
+                            ui.end_row();
+                        });
+                        if primary_button(ui, "Unlock Temporarily").clicked() {
+                            self.unlock();
+                        }
 
-        ui.add_space(14.0);
-        section_frame().show(ui, |ui| {
-            section_title(ui, "Password");
-            form_grid(ui, "change-password", |ui| {
-                password_editor(ui, "New password", &mut self.passwords.new_first);
-                password_editor(ui, "New password again", &mut self.passwords.new_again);
-            });
-            password_suggestion(ui, self);
-            if primary_button(ui, "Change Password").clicked() {
-                self.change_password();
-            }
-        });
+                        if let Some(status) = &self.status {
+                            if let Some(value) = &status.locked_until {
+                                meta_label(ui, format!("Scheduled lock ends: {value}"));
+                            }
+                            if let Some(value) = &status.unlock_expires_at {
+                                meta_label(ui, format!("Temporary unlock expires: {value}"));
+                            }
+                        }
+                    });
 
-        ui.add_space(14.0);
-        section_frame().show(ui, |ui| {
-            section_title(ui, "Manual Lock");
-            if secondary_button(ui, "Clear Temporary Unlock").clicked() {
-                self.manual_lock();
-            }
+                    ui.add_space(14.0);
+                    section_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        section_title(ui, "Password");
+                        form_grid(ui, "change-password", |ui| {
+                            password_editor(ui, "New password", &mut self.passwords.new_first);
+                            password_editor(
+                                ui,
+                                "New password again",
+                                &mut self.passwords.new_again,
+                            );
+                        });
+                        password_suggestion(ui, self);
+                        if primary_button(ui, "Change Password").clicked() {
+                            self.change_password();
+                        }
+                    });
+
+                    ui.add_space(14.0);
+                    section_frame().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        section_title(ui, "Manual Lock");
+                        if secondary_button(ui, "Clear Temporary Unlock").clicked() {
+                            self.manual_lock();
+                        }
+                    });
+                });
         });
     }
 }
@@ -1177,6 +1258,73 @@ fn status_pill(ui: &mut egui::Ui, status: &str, configured: bool) {
                     .size(13.5),
             );
         });
+}
+
+fn status_summary(ui: &mut egui::Ui, status: &StatusPayload) {
+    let (label, color) = if status.allowed {
+        ("PROMPTS ALLOWED", aomidori())
+    } else {
+        ("PROMPTS BLOCKED", enji())
+    };
+    ui.label(egui::RichText::new(label).size(18.0).strong().color(color));
+    meta_label(ui, status.reason.as_str());
+    if let Some(value) = &status.locked_until {
+        meta_label(ui, format!("Lock ends {value}"));
+    }
+    if let Some(value) = &status.unlock_expires_at {
+        meta_label(ui, format!("Temporary unlock until {value}"));
+    }
+}
+
+fn protection_summary(ui: &mut egui::Ui, protection: &ProtectionStatus) {
+    subsection_title(ui, "Prompt Gate");
+    protection_row(
+        ui,
+        "Codex hook",
+        protection.codex_hook,
+        "loaded by Codex after restart/trust",
+    );
+    protection_row(
+        ui,
+        "Codex launcher",
+        protection.codex_launcher,
+        "installed in ~/.local/bin",
+    );
+    protection_row(
+        ui,
+        "Codex PATH",
+        protection.codex_path_uses_launcher,
+        "codex command uses launcher",
+    );
+    ui.add_space(6.0);
+    protection_row(
+        ui,
+        "Claude hook",
+        protection.claude_hook,
+        "loaded by Claude Code after restart",
+    );
+    protection_row(
+        ui,
+        "Claude launcher",
+        protection.claude_launcher,
+        "installed in ~/.local/bin",
+    );
+    protection_row(
+        ui,
+        "Claude PATH",
+        protection.claude_path_uses_launcher,
+        "claude command uses launcher",
+    );
+}
+
+fn protection_row(ui: &mut egui::Ui, label: &str, ok: bool, detail: &str) {
+    ui.horizontal_wrapped(|ui| {
+        let marker = if ok { "READY" } else { "MISSING" };
+        let color = if ok { aomidori() } else { enji() };
+        ui.label(egui::RichText::new(marker).strong().color(color).size(12.0));
+        ui.label(egui::RichText::new(label).strong().color(sumi()).size(13.0));
+        meta_label(ui, detail);
+    });
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str) {
@@ -1507,6 +1655,30 @@ enum CommandKind {
         #[arg(long)]
         hook_command: Option<String>,
     },
+    InstallLaunchers {
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(long, default_value = "claude,codex")]
+        targets: String,
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+    },
+    UninstallLaunchers {
+        #[arg(long)]
+        password_stdin: bool,
+        #[arg(long, default_value = "claude,codex")]
+        targets: String,
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+    },
+    Launch {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        real: PathBuf,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     Uninstall {
         #[arg(long)]
         password_stdin: bool,
@@ -1666,6 +1838,46 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             }
             Ok(0)
         }
+        CommandKind::InstallLaunchers {
+            password_stdin,
+            targets,
+            bin_dir,
+        } => {
+            require_action_password(core, password_stdin, "install")?;
+            for target in parse_targets(&targets)? {
+                let report = install_launcher(&target, bin_dir.as_deref())?;
+                if let Some(backup) = report.backup {
+                    println!(
+                        "Installed {target} launcher at {}. backup: {}",
+                        report.wrapper.display(),
+                        backup.display()
+                    );
+                } else {
+                    println!(
+                        "Installed {target} launcher at {}.",
+                        report.wrapper.display()
+                    );
+                }
+            }
+            Ok(0)
+        }
+        CommandKind::UninstallLaunchers {
+            password_stdin,
+            targets,
+            bin_dir,
+        } => {
+            require_action_password(core, password_stdin, "uninstall")?;
+            for target in parse_targets(&targets)? {
+                let restored = uninstall_launcher(&target, bin_dir.as_deref())?;
+                if let Some(path) = restored {
+                    println!("Removed {target} launcher and restored {}.", path.display());
+                } else {
+                    println!("Removed {target} launcher.");
+                }
+            }
+            Ok(0)
+        }
+        CommandKind::Launch { agent, real, args } => launch_agent(core, &agent, &real, &args),
         CommandKind::Uninstall {
             password_stdin,
             targets,
@@ -1802,6 +2014,270 @@ fn parse_targets(raw: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(targets)
+}
+
+fn protection_status() -> ProtectionStatus {
+    ProtectionStatus {
+        codex_hook: hook_installed("codex"),
+        claude_hook: hook_installed("claude"),
+        codex_launcher: launcher_installed("codex"),
+        claude_launcher: launcher_installed("claude"),
+        codex_path_uses_launcher: command_uses_launcher("codex"),
+        claude_path_uses_launcher: command_uses_launcher("claude"),
+    }
+}
+
+fn hook_installed(target: &str) -> bool {
+    let Ok(path) = target_path(target, None) else {
+        return false;
+    };
+    let agent = target_agent(target);
+    prompt_parole_hook_installed(&path, &agent)
+}
+
+fn prompt_parole_hook_installed(path: &Path, agent: &str) -> bool {
+    let Ok(data) = load_json_object(path) else {
+        return false;
+    };
+    let Some(groups) = data
+        .get("hooks")
+        .and_then(|value| value.get("UserPromptSubmit"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    groups.iter().any(|group| {
+        group
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|hooks| {
+                hooks.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|command| is_prompt_parole_hook_command(command, agent))
+                })
+            })
+    })
+}
+
+fn is_prompt_parole_hook_command(command: &str, agent: &str) -> bool {
+    let has_marker =
+        command.contains("PROMPT_PAROLE_HOOK=1") || command.contains("prompt-parole hook --agent");
+    has_marker && command.contains(&format!("--agent {agent}"))
+}
+
+fn launcher_installed(target: &str) -> bool {
+    launcher_bin_dir(None).is_ok_and(|dir| is_prompt_parole_launcher(&dir.join(target)))
+}
+
+fn command_uses_launcher(target: &str) -> bool {
+    find_on_path(target).is_some_and(|path| is_prompt_parole_launcher(&path))
+}
+
+fn find_on_path(target: &str) -> Option<PathBuf> {
+    let paths = env::var_os("PATH")?;
+    for dir in env::split_paths(&paths) {
+        let candidate = dir.join(target);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+struct LauncherInstallReport {
+    wrapper: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+fn install_launcher(target: &str, bin_dir: Option<&Path>) -> Result<LauncherInstallReport, String> {
+    let dir = launcher_bin_dir(bin_dir)?;
+    fs::create_dir_all(&dir).map_err(|err| format!("Could not create {}: {err}", dir.display()))?;
+    let wrapper = dir.join(target);
+    let real = locate_real_agent_binary(target, &wrapper)?;
+    let backup = if wrapper.exists() && !is_prompt_parole_launcher(&wrapper) {
+        let backup = wrapper.with_file_name(format!(
+            "{}.prompt-parole.backup.{}",
+            target,
+            Utc::now().format("%Y%m%d%H%M%S")
+        ));
+        fs::rename(&wrapper, &backup).map_err(|err| {
+            format!(
+                "Could not back up {} to {}: {err}",
+                wrapper.display(),
+                backup.display()
+            )
+        })?;
+        Some(backup)
+    } else {
+        None
+    };
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("prompt-parole"));
+    write_launcher_script(&wrapper, &exe, target, &real)?;
+    Ok(LauncherInstallReport { wrapper, backup })
+}
+
+fn uninstall_launcher(target: &str, bin_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let dir = launcher_bin_dir(bin_dir)?;
+    let wrapper = dir.join(target);
+    if wrapper.exists() {
+        if !is_prompt_parole_launcher(&wrapper) {
+            return Err(format!(
+                "{} is not a Prompt Parole launcher; refusing to remove it.",
+                wrapper.display()
+            ));
+        }
+        fs::remove_file(&wrapper)
+            .map_err(|err| format!("Could not remove {}: {err}", wrapper.display()))?;
+    }
+    if let Some(backup) = latest_launcher_backup(&dir, target)? {
+        fs::rename(&backup, &wrapper).map_err(|err| {
+            format!(
+                "Could not restore {} to {}: {err}",
+                backup.display(),
+                wrapper.display()
+            )
+        })?;
+        return Ok(Some(wrapper));
+    }
+    Ok(None)
+}
+
+fn launcher_bin_dir(bin_dir: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(path) = bin_dir {
+        return Ok(path.to_path_buf());
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".local").join("bin"))
+        .ok_or_else(|| "Could not find home directory.".to_owned())
+}
+
+fn locate_real_agent_binary(target: &str, wrapper: &Path) -> Result<PathBuf, String> {
+    if wrapper.exists()
+        && !is_prompt_parole_launcher(wrapper)
+        && let Ok(path) = fs::canonicalize(wrapper)
+    {
+        return Ok(path);
+    }
+
+    let known = if target == "codex" {
+        vec![
+            PathBuf::from("/opt/homebrew/bin/codex"),
+            PathBuf::from("/usr/local/bin/codex"),
+            PathBuf::from("/usr/bin/codex"),
+        ]
+    } else {
+        vec![
+            PathBuf::from("/opt/homebrew/bin/claude"),
+            PathBuf::from("/usr/local/bin/claude"),
+            PathBuf::from("/usr/bin/claude"),
+        ]
+    };
+    for path in known {
+        if path.exists() && path != wrapper {
+            return fs::canonicalize(&path)
+                .map_err(|err| format!("Could not resolve {}: {err}", path.display()));
+        }
+    }
+
+    let output = Command::new("which")
+        .args(["-a", target])
+        .output()
+        .map_err(|err| format!("Could not find {target}: {err}"))?;
+    if output.status.success() {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let path = PathBuf::from(line.trim());
+            if path == wrapper || is_prompt_parole_launcher(&path) {
+                continue;
+            }
+            if path.exists() {
+                return fs::canonicalize(&path)
+                    .map_err(|err| format!("Could not resolve {}: {err}", path.display()));
+            }
+        }
+    }
+    Err(format!("Could not find the real {target} binary."))
+}
+
+fn write_launcher_script(
+    wrapper: &Path,
+    prompt_parole_exe: &Path,
+    target: &str,
+    real: &Path,
+) -> Result<(), String> {
+    let script = format!(
+        "#!/bin/sh\n# PROMPT_PAROLE_LAUNCHER=1\nexec {} launch --agent {} --real {} -- \"$@\"\n",
+        shell_quote(&prompt_parole_exe.to_string_lossy()),
+        shell_quote(target),
+        shell_quote(&real.to_string_lossy())
+    );
+    fs::write(wrapper, script)
+        .map_err(|err| format!("Could not write {}: {err}", wrapper.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755))
+            .map_err(|err| format!("Could not make {} executable: {err}", wrapper.display()))?;
+    }
+    Ok(())
+}
+
+fn is_prompt_parole_launcher(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|value| value.contains("PROMPT_PAROLE_LAUNCHER=1"))
+}
+
+fn latest_launcher_backup(dir: &Path, target: &str) -> Result<Option<PathBuf>, String> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let prefix = format!("{target}.prompt-parole.backup.");
+    let mut backups = Vec::new();
+    for entry in
+        fs::read_dir(dir).map_err(|err| format!("Could not read {}: {err}", dir.display()))?
+    {
+        let entry = entry.map_err(|err| format!("Could not read launcher backup: {err}"))?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(&prefix) {
+            backups.push(entry.path());
+        }
+    }
+    backups.sort();
+    Ok(backups.pop())
+}
+
+fn launch_agent(
+    core: &ParoleCore,
+    agent: &str,
+    real: &Path,
+    args: &[String],
+) -> Result<i32, String> {
+    if agent != "codex" && agent != "claude" {
+        return Err(format!("Unsupported launcher agent {agent:?}."));
+    }
+    if core.is_configured() {
+        let decision = core.decision()?;
+        if !decision.allowed {
+            let until = decision
+                .locked_until
+                .map(|value| value.format("%Y-%m-%d %H:%M %Z").to_string())
+                .unwrap_or_else(|| "the scheduled unlock time".to_owned());
+            eprintln!("Prompt Parole: curfew is active until {until}.");
+            return Ok(1);
+        }
+    }
+    let mut command = Command::new(real);
+    if agent == "codex"
+        && !args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-hook-trust")
+    {
+        command.arg("--dangerously-bypass-hook-trust");
+    }
+    let status = command
+        .args(args)
+        .status()
+        .map_err(|err| format!("Could not launch {}: {err}", real.display()))?;
+    Ok(status.code().unwrap_or(1))
 }
 
 fn target_agent(target: &str) -> String {
@@ -1987,8 +2463,8 @@ fn run_gui() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Prompt Parole")
-            .with_inner_size([920.0, 760.0])
-            .with_min_inner_size([680.0, 520.0]),
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([920.0, 620.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -2173,6 +2649,48 @@ mod tests {
             groups[0]["hooks"][0]["command"].as_str().unwrap(),
             "echo keep-me"
         );
+    }
+
+    #[test]
+    fn prompt_parole_hook_status_detects_agent_specific_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        write_json_atomic(
+            &path,
+            &serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "PROMPT_PAROLE_HOOK=1 /tmp/prompt-parole hook --agent codex",
+                            "timeout": 5
+                        }]
+                    }]
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(prompt_parole_hook_installed(&path, "codex"));
+        assert!(!prompt_parole_hook_installed(&path, "claude-code"));
+    }
+
+    #[test]
+    fn launcher_script_is_marked_as_prompt_parole_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("codex");
+        write_launcher_script(
+            &wrapper,
+            Path::new("/tmp/prompt-parole"),
+            "codex",
+            Path::new("/opt/homebrew/bin/codex"),
+        )
+        .unwrap();
+
+        assert!(is_prompt_parole_launcher(&wrapper));
+        let script = fs::read_to_string(wrapper).unwrap();
+        assert!(script.contains("launch --agent codex"));
+        assert!(script.contains("--real /opt/homebrew/bin/codex"));
     }
 
     #[test]

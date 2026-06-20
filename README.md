@@ -14,8 +14,10 @@ Repository: <https://github.com/jake-w-liu/prompt-parole>
 ## What It Does
 
 - Blocks Claude Code and Codex prompts during configured hours.
-- Uses `UserPromptSubmit` hooks, so the prompt is stopped before the agent sees
-  it.
+- Uses `UserPromptSubmit` hooks for prompt-time blocking, so existing output
+  and progress stay visible.
+- Can install local launch wrappers so new `codex` and `claude` launches are
+  rejected during curfew before the agent starts.
 - Sets the password once with double entry.
 - Changes the password only after the current password is entered.
 - Rejects blank passwords, but does not impose a fixed minimum length.
@@ -32,10 +34,11 @@ From a checkout:
 cargo build --release --manifest-path desktop/Cargo.toml
 install -m 755 desktop/target/release/prompt-parole "$HOME/.local/bin/prompt-parole"
 prompt-parole install
+prompt-parole install-launchers
 ```
 
-After installing hooks, restart Claude Code and Codex once so those running
-sessions load the hook command.
+After installing hooks and launchers, restart Claude Code and Codex once so new
+sessions use the protected launch path and load the hook command.
 
 Once packaging is added, installation can be made friendlier. For now, the
 release binary above is the supported path.
@@ -92,6 +95,11 @@ Japanese palette inspired by Nippon Colors and Sanzo Wada-style
 color-combination references, because a relationship-saving tool should not look
 like a router admin page.
 
+The configured desktop view has two columns: schedule and settings on the left,
+current lock state and protection status on the right. Use **Install Hooks &
+Launchers** after entering the current password to install both prompt hooks and
+local `codex`/`claude` launch wrappers.
+
 ## Config
 
 The generated config looks like this:
@@ -140,13 +148,35 @@ When locked, the hook emits:
 
 When allowed, it emits nothing and exits successfully.
 
-The hook is evaluated on every prompt by sessions that loaded it. That means a
-session started at 6:30 PM should block its next prompt after a 7:00 PM curfew.
+The hook is evaluated on every prompt by sessions that loaded and trusted it.
+That means a session started at 6:30 PM should block its next prompt after a
+7:00 PM curfew while still showing the output that already exists.
 
 Already-running sessions that predate hook installation cannot be retroactively
-forced to load a hook by editing a config file. Blocking those without restarting
-requires a separate active enforcer that controls or pauses existing processes,
-which is intentionally not enabled by default.
+forced to load a hook by editing a config file. Reopen Claude Code or Codex
+through the protected launcher after installation. That is the path that blocks
+new prompts without hiding ongoing results.
+
+Codex also requires non-managed command hooks to be trusted before they run.
+Prompt Parole's Codex launcher wrapper starts Codex with hook trust bypass for
+that invocation, then the Prompt Parole hook itself makes the allow/block
+decision.
+
+## Protection Layers
+
+Prompt Parole has two local layers:
+
+1. **Hooks** block prompt submissions in Claude Code and Codex sessions that have
+   loaded and trusted the hook.
+2. **Launch wrappers** block new `codex` and `claude` process launches during
+   curfew. The wrappers live in `~/.local/bin`, which should appear before
+   Homebrew or system binary directories in `PATH`.
+
+This does not intercept hosted web chats or remote surfaces that do not run
+through your local Claude/Codex process. It also cannot rewrite a process that
+was already running and ignoring hooks. Prompt Parole intentionally does not
+pause or kill running agent processes, because that would also stop or hide the
+progress you wanted to inspect.
 
 ## Security Model
 
