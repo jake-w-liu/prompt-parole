@@ -57,14 +57,17 @@ class PromptParole:
         password: str,
         *,
         lock_windows: list[str] | None = None,
+        timezone_name: str | None = None,
         unlock_duration_minutes: int | None = None,
         password_required_for: list[str] | None = None,
     ) -> None:
         if self.secret_file.exists():
             raise PasswordError("Prompt Parole is already configured. Use `prompt-parole passwd` to change the password.")
         config = normalize_config(DEFAULT_CONFIG)
-        if lock_windows:
+        if lock_windows is not None:
             config["lock_windows"] = [parse_window(window) for window in lock_windows]
+        if timezone_name:
+            config["timezone"] = timezone_name
         if unlock_duration_minutes is not None:
             config["unlock_duration_minutes"] = unlock_duration_minutes
         if password_required_for is not None:
@@ -96,7 +99,7 @@ class PromptParole:
     ) -> dict[str, Any]:
         self.assert_password(current_password)
         config = self.load_config()
-        if lock_windows:
+        if lock_windows is not None:
             config["lock_windows"] = [parse_window(window) for window in lock_windows]
         if timezone_name:
             config["timezone"] = timezone_name

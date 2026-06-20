@@ -57,6 +57,93 @@ def render_page(app: PromptParole, message: str = "", error: str = "") -> str:
         f'<label><input type="checkbox" name="password_required_for" value="{_esc(action)}"{_checked(action, action_values)}> {_esc(action)}</label>'
         for action in sorted(PASSWORD_ACTIONS)
     )
+    if configured:
+        body = f"""
+    <h2>Settings</h2>
+    <form method="post" action="/configure">
+      <label>Current password
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <label>Lock windows
+        <textarea name="lock_windows" spellcheck="false">{windows}</textarea>
+        <span class="hint">One per line: HH:MM-HH:MM or HH:MM-HH:MM mon,tue. Days: {_esc(day_hint)}.</span>
+      </label>
+      <div class="row">
+        <label>Timezone
+          <input name="timezone" value="{_esc(config['timezone'])}">
+        </label>
+        <label>Unlock duration, minutes
+          <input name="unlock_duration_minutes" type="number" min="1" value="{_esc(config['unlock_duration_minutes'])}">
+        </label>
+      </div>
+      <label>Password required for</label>
+      <div class="checks">{action_boxes}</div>
+      <button type="submit">Save Settings</button>
+    </form>
+
+    <h2>Unlock</h2>
+    <form method="post" action="/unlock">
+      <div class="row">
+        <label>Password
+          <input type="password" name="password" autocomplete="current-password" required>
+        </label>
+        <label>Duration, minutes
+          <input name="duration_minutes" type="number" min="1" placeholder="{_esc(config['unlock_duration_minutes'])}">
+        </label>
+      </div>
+      <button type="submit">Unlock</button>
+    </form>
+
+    <h2>Password</h2>
+    <form method="post" action="/passwd">
+      <label>Current password
+        <input type="password" name="current_password" autocomplete="current-password" required>
+      </label>
+      <div class="row">
+        <label>New password
+          <input type="password" name="new_password" autocomplete="new-password" required>
+        </label>
+        <label>New password again
+          <input type="password" name="new_password_again" autocomplete="new-password" required>
+        </label>
+      </div>
+      <button type="submit">Change Password</button>
+    </form>
+
+    <h2>Manual Lock</h2>
+    <form method="post" action="/lock">
+      <button class="secondary" type="submit">Clear Temporary Unlock</button>
+    </form>
+"""
+    else:
+        body = f"""
+    <h2>First Setup</h2>
+    <form method="post" action="/setup">
+      <div class="row">
+        <label>Password
+          <input type="password" name="password" autocomplete="new-password" required>
+        </label>
+        <label>Password again
+          <input type="password" name="password_again" autocomplete="new-password" required>
+        </label>
+      </div>
+      <label>Lock windows
+        <textarea name="lock_windows" spellcheck="false">{windows}</textarea>
+        <span class="hint">One per line: HH:MM-HH:MM or HH:MM-HH:MM mon,tue. Days: {_esc(day_hint)}.</span>
+      </label>
+      <div class="row">
+        <label>Timezone
+          <input name="timezone" value="{_esc(config['timezone'])}">
+        </label>
+        <label>Unlock duration, minutes
+          <input name="unlock_duration_minutes" type="number" min="1" value="{_esc(config['unlock_duration_minutes'])}">
+        </label>
+      </div>
+      <label>Password required for</label>
+      <div class="checks">{action_boxes}</div>
+      <button type="submit">Start Parole</button>
+    </form>
+"""
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -215,62 +302,7 @@ def render_page(app: PromptParole, message: str = "", error: str = "") -> str:
     </div>
     {message_html}
     {error_html}
-
-    <h2>Settings</h2>
-    <form method="post" action="/configure">
-      <label>Current password
-        <input type="password" name="password" autocomplete="current-password" required>
-      </label>
-      <label>Lock windows
-        <textarea name="lock_windows" spellcheck="false">{windows}</textarea>
-        <span class="hint">One per line: HH:MM-HH:MM or HH:MM-HH:MM mon,tue. Days: {_esc(day_hint)}.</span>
-      </label>
-      <div class="row">
-        <label>Timezone
-          <input name="timezone" value="{_esc(config['timezone'])}">
-        </label>
-        <label>Unlock duration, minutes
-          <input name="unlock_duration_minutes" type="number" min="1" value="{_esc(config['unlock_duration_minutes'])}">
-        </label>
-      </div>
-      <label>Password required for</label>
-      <div class="checks">{action_boxes}</div>
-      <button type="submit">Save Settings</button>
-    </form>
-
-    <h2>Unlock</h2>
-    <form method="post" action="/unlock">
-      <div class="row">
-        <label>Password
-          <input type="password" name="password" autocomplete="current-password" required>
-        </label>
-        <label>Duration, minutes
-          <input name="duration_minutes" type="number" min="1" placeholder="{_esc(config['unlock_duration_minutes'])}">
-        </label>
-      </div>
-      <button type="submit">Unlock</button>
-    </form>
-
-    <h2>Password</h2>
-    <form method="post" action="/passwd">
-      <label>Current password
-        <input type="password" name="current_password" autocomplete="current-password" required>
-      </label>
-      <div class="row">
-        <label>New password
-          <input type="password" name="new_password" autocomplete="new-password" required>
-        </label>
-        <label>New password again
-          <input type="password" name="new_password_again" autocomplete="new-password" required>
-        </label>
-      </div>
-      <button type="submit">Change Password</button>
-    </form>
-
-    <h2>Manual Lock</h2>
-    <form method="post" action="/lock">
-      <button class="secondary" type="submit">Clear Temporary Unlock</button>
-    </form>
+    {body}
   </main>
 </body>
 </html>
@@ -309,6 +341,22 @@ class PromptParoleHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             form = self._form()
+            if self.path == "/setup":
+                password = self._value(form, "password")
+                if password != self._value(form, "password_again"):
+                    raise PromptParoleError("Passwords do not match.")
+                windows = _parse_window_lines(self._value(form, "lock_windows"))
+                duration = int(self._value(form, "unlock_duration_minutes"))
+                actions = [str(value).lower() for value in form.get("password_required_for", [])]
+                self.app.setup(
+                    password,
+                    lock_windows=windows,
+                    timezone_name=self._value(form, "timezone", "local"),
+                    unlock_duration_minutes=duration,
+                    password_required_for=actions,
+                )
+                self._send_html(render_page(self.app, message="Prompt Parole is set up."))
+                return
             if self.path == "/configure":
                 windows = _parse_window_lines(self._value(form, "lock_windows"))
                 duration = int(self._value(form, "unlock_duration_minutes"))

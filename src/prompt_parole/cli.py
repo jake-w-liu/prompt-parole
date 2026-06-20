@@ -74,6 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup = sub.add_parser("setup", help="Set the password and initial lock schedule.")
     setup.add_argument("--password-stdin", action="store_true", help="Read password and confirmation from stdin.")
     setup.add_argument("--lock-window", action="append", help="Lock window like 19:00-05:00. Can be repeated.")
+    setup.add_argument("--timezone", help="Timezone name, or local.")
     setup.add_argument("--unlock-duration-minutes", type=int, help="Default temporary unlock duration.")
     setup.add_argument("--password-required-for", help="Comma-separated actions requiring password.")
 
@@ -144,6 +145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             app.setup(
                 password,
                 lock_windows=args.lock_window,
+                timezone_name=args.timezone,
                 unlock_duration_minutes=args.unlock_duration_minutes,
                 password_required_for=_action_list(args.password_required_for),
             )

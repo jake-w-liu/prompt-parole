@@ -18,6 +18,13 @@ class GuiTests(unittest.TestCase):
             self.assertIn('action="/configure"', html)
             self.assertIn('name="password_required_for"', html)
 
+    def test_render_page_supports_first_setup_before_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            html = render_page(PromptParole(Path(tmp)))
+            self.assertIn("First Setup", html)
+            self.assertIn('action="/setup"', html)
+            self.assertIn("Start Parole", html)
+
     def test_parse_window_lines_preserves_days(self):
         self.assertEqual(
             _parse_window_lines("19:00-05:00 mon,tue\n\n10:00-11:00 fri"),
