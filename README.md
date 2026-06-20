@@ -36,6 +36,7 @@ From a checkout:
 ```sh
 cargo build --release --manifest-path desktop/Cargo.toml
 install -m 755 desktop/target/release/prompt-parole "$HOME/.local/bin/prompt-parole"
+prompt-parole install-app
 prompt-parole install
 prompt-parole install-launchers
 ```
@@ -66,6 +67,14 @@ cargo build --release --manifest-path desktop/Cargo.toml
 desktop/target/release/prompt-parole
 ```
 
+To install it as a normal macOS app with the correct **Prompt Parole** app menu
+and Finder/Applications identity:
+
+```sh
+prompt-parole install-app
+open "$HOME/Applications/Prompt Parole.app"
+```
+
 The first screen sets the password, default unlock duration, timezone, and
 global lock schedule. The schedule applies to both Claude Code and Codex hooks.
 Times are selected with start/end dropdowns and day checkboxes; no raw JSON
@@ -90,6 +99,7 @@ prompt-parole guard --once --json
 prompt-parole guard-agent --action start
 prompt-parole guard-agent --action stop
 prompt-parole guard-agent --action status
+prompt-parole install-app
 prompt-parole gui
 ```
 

@@ -678,7 +678,9 @@ impl WindowDraft {
 
 #[derive(Default)]
 struct PasswordFields {
-    current: String,
+    settings_current: String,
+    install_current: String,
+    change_current: String,
     new_first: String,
     new_again: String,
     setup_first: String,
@@ -812,14 +814,14 @@ impl PromptParoleApp {
             }
         };
         match self.core.configure(
-            &self.passwords.current,
+            &self.passwords.settings_current,
             windows,
             self.timezone.clone(),
             self.unlock_duration_minutes,
             self.password_actions.clone(),
         ) {
             Ok(_) => {
-                self.passwords.current.clear();
+                self.passwords.settings_current.clear();
                 self.reload();
                 self.status_line = "Settings saved.".to_owned();
             }
@@ -850,10 +852,10 @@ impl PromptParoleApp {
         }
         match self
             .core
-            .change_password(&self.passwords.current, &self.passwords.new_first)
+            .change_password(&self.passwords.change_current, &self.passwords.new_first)
         {
             Ok(_) => {
-                self.passwords.current.clear();
+                self.passwords.change_current.clear();
                 self.passwords.new_first.clear();
                 self.passwords.new_again.clear();
                 self.generated_password.clear();
@@ -877,7 +879,7 @@ impl PromptParoleApp {
 
     fn install_protection(&mut self) {
         self.error.clear();
-        if let Err(err) = self.core.assert_password(&self.passwords.current) {
+        if let Err(err) = self.core.assert_password(&self.passwords.install_current) {
             self.error = err;
             return;
         }
@@ -901,7 +903,7 @@ impl PromptParoleApp {
             }
             installed += 1;
         }
-        self.passwords.current.clear();
+        self.passwords.install_current.clear();
         self.status_line = format!("Installed hooks and launchers for {installed} tools.");
         self.reload();
     }
@@ -916,6 +918,19 @@ impl PromptParoleApp {
             }
             Err(err) => {
                 self.error = format!("Could not start input guard: {err}");
+            }
+        }
+    }
+
+    fn install_app_bundle(&mut self) {
+        self.error.clear();
+        match install_macos_app_bundle(None) {
+            Ok(path) => {
+                self.status_line = format!("Installed app at {}.", path.display());
+                self.reload();
+            }
+            Err(err) => {
+                self.error = format!("Could not install app: {err}");
             }
         }
     }
@@ -949,167 +964,331 @@ impl eframe::App for PromptParoleApp {
         apply_style(ui.ctx());
         egui::Frame::new()
             .fill(shironeri())
-            .inner_margin(22)
+            .inner_margin(0)
             .show(ui, |ui| {
-                app_header(ui, &self.status_line, self.configured);
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if primary_button(ui, "Refresh").clicked() {
-                        self.reload();
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("Config {}", self.app_dir.display()))
-                            .color(rikyunezumi())
-                            .size(13.0),
-                    );
-                });
-                if !self.error.is_empty() {
-                    ui.add_space(10.0);
-                    alert_frame().show(ui, |ui| {
-                        ui.colored_label(enji(), egui::RichText::new(&self.error).strong());
-                    });
-                }
-                ui.add_space(14.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        centered_page(ui, |ui| {
+                            app_header(ui, &self.status_line, self.configured);
+                            ui.add_space(18.0);
+                            if !self.error.is_empty() {
+                                ui.add_space(12.0);
+                                alert_frame().show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.colored_label(
+                                        enji(),
+                                        egui::RichText::new(&self.error).strong().size(14.0),
+                                    );
+                                });
+                            }
+                            ui.add_space(18.0);
 
-                if self.configured {
-                    self.configured_ui(ui);
-                } else {
-                    egui::ScrollArea::vertical().show(ui, |ui| self.setup_ui(ui));
-                }
+                            if self.configured {
+                                self.configured_ui(ui);
+                            } else {
+                                self.setup_ui(ui);
+                            }
+                        });
+                    });
             });
     }
 }
 
 impl PromptParoleApp {
     fn setup_ui(&mut self, ui: &mut egui::Ui) {
-        section_frame().show(ui, |ui| {
-            section_title(ui, "First Setup");
-            form_grid(ui, "setup-passwords", |ui| {
-                password_editor(ui, "Password", &mut self.passwords.setup_first);
-                password_editor(ui, "Password again", &mut self.passwords.setup_again);
+        let wide = ui.available_width() >= 900.0;
+        if wide {
+            ui.horizontal_top(|ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical(|ui| {
+                    ui.set_width(340.0);
+                    setup_password_card(ui, self);
+                });
+                ui.add_space(16.0);
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    schedule_settings_card(ui, self, true);
+                });
             });
-            password_suggestion(ui, self);
-            ui.add_space(8.0);
-            settings_editor(
-                ui,
-                &mut self.timezone,
-                &mut self.unlock_duration_minutes,
-                &mut self.windows,
-                &mut self.password_actions,
-            );
-            ui.add_space(10.0);
-            if primary_button(ui, "Start Parole").clicked() {
-                self.setup();
-            }
-        });
+        } else {
+            setup_password_card(ui, self);
+            ui.add_space(14.0);
+            schedule_settings_card(ui, self, true);
+        }
     }
 
     fn configured_ui(&mut self, ui: &mut egui::Ui) {
-        let column_height = ui.available_height();
-        ui.columns(2, |columns| {
-            egui::ScrollArea::vertical()
-                .id_salt("schedule-settings-column")
-                .max_height(column_height)
-                .show(&mut columns[0], |ui| {
-                    section_frame().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        section_title(ui, "Schedule & Settings");
-                        form_grid(ui, "current-password", |ui| {
-                            password_editor(ui, "Current password", &mut self.passwords.current);
-                        });
-                        settings_editor(
-                            ui,
-                            &mut self.timezone,
-                            &mut self.unlock_duration_minutes,
-                            &mut self.windows,
-                            &mut self.password_actions,
-                        );
-                        ui.add_space(10.0);
-                        if primary_button(ui, "Save Settings").clicked() {
-                            self.save_settings();
-                        }
-                    });
+        let wide = ui.available_width() >= 980.0;
+        overview_card(ui, self);
+        ui.add_space(14.0);
+        if wide {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width((ui.available_width() - 18.0) * 0.58);
+                    schedule_settings_card(ui, self, false);
+                    ui.add_space(14.0);
+                    protection_card(ui, self);
                 });
-
-            egui::ScrollArea::vertical()
-                .id_salt("actions-column")
-                .max_height(column_height)
-                .show(&mut columns[1], |ui| {
-                    section_frame().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        section_title(ui, "Now");
-                        if let Some(status) = &self.status {
-                            status_summary(ui, status);
-                        }
-                        ui.add_space(10.0);
-                        protection_summary(ui, &self.protection);
-                        ui.add_space(10.0);
-                        if primary_button(ui, "Start Input Guard").clicked() {
-                            self.start_input_guard();
-                        }
-                        if secondary_button(ui, "Install Hooks & Launchers").clicked() {
-                            self.install_protection();
-                        }
-                        meta_label(ui, "Input Guard blocks this already-open Terminal prompt while keeping output visible. Hooks and launchers protect reopened sessions.");
-                    });
-
+                ui.add_space(18.0);
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    unlock_card(ui, self);
                     ui.add_space(14.0);
-                    section_frame().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        section_title(ui, "Temporary Unlock");
-                        form_grid(ui, "unlock-form", |ui| {
-                            password_editor(ui, "Password", &mut self.passwords.unlock);
-                            ui.label("Duration");
-                            ui.add(
-                                egui::DragValue::new(&mut self.unlock_request_minutes)
-                                    .range(1..=1440)
-                                    .suffix(" min"),
-                            );
-                            ui.end_row();
-                        });
-                        if primary_button(ui, "Unlock Temporarily").clicked() {
-                            self.unlock();
-                        }
-
-                        if let Some(status) = &self.status {
-                            if let Some(value) = &status.locked_until {
-                                meta_label(ui, format!("Scheduled lock ends: {value}"));
-                            }
-                            if let Some(value) = &status.unlock_expires_at {
-                                meta_label(ui, format!("Temporary unlock expires: {value}"));
-                            }
-                        }
-                    });
-
+                    password_card(ui, self);
                     ui.add_space(14.0);
-                    section_frame().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        section_title(ui, "Password");
-                        form_grid(ui, "change-password", |ui| {
-                            password_editor(ui, "New password", &mut self.passwords.new_first);
-                            password_editor(
-                                ui,
-                                "New password again",
-                                &mut self.passwords.new_again,
-                            );
-                        });
-                        password_suggestion(ui, self);
-                        if primary_button(ui, "Change Password").clicked() {
-                            self.change_password();
-                        }
-                    });
-
-                    ui.add_space(14.0);
-                    section_frame().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        section_title(ui, "Manual Lock");
-                        if secondary_button(ui, "Clear Temporary Unlock").clicked() {
-                            self.manual_lock();
-                        }
-                    });
+                    manual_lock_card(ui, self);
                 });
-        });
+            });
+        } else {
+            schedule_settings_card(ui, self, false);
+            ui.add_space(14.0);
+            unlock_card(ui, self);
+            ui.add_space(14.0);
+            password_card(ui, self);
+            ui.add_space(14.0);
+            protection_card(ui, self);
+            ui.add_space(14.0);
+            manual_lock_card(ui, self);
+        }
     }
+}
+
+fn setup_password_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_title(ui, "First Setup");
+        vertical_password_editor(ui, "Password", &mut app.passwords.setup_first);
+        ui.add_space(8.0);
+        vertical_password_editor(ui, "Password again", &mut app.passwords.setup_again);
+        ui.add_space(12.0);
+        password_suggestion(ui, app);
+        ui.add_space(16.0);
+        if full_primary_button(ui, "Start Parole").clicked() {
+            app.setup();
+        }
+    });
+}
+
+fn overview_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - 20.0).max(320.0) * 0.55);
+                section_title(ui, "Prompt State");
+                if let Some(status) = &app.status {
+                    status_summary(ui, status);
+                }
+                meta_label(ui, format!("Config {}", app.app_dir.display()));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                if secondary_button(ui, "Refresh").clicked() {
+                    app.reload();
+                }
+                if primary_button(ui, "Start Input Guard").clicked() {
+                    app.start_input_guard();
+                }
+            });
+        });
+    });
+}
+
+fn schedule_settings_card(ui: &mut egui::Ui, app: &mut PromptParoleApp, setup: bool) {
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_title(
+            ui,
+            if setup {
+                "Lock Schedule"
+            } else {
+                "Schedule & Settings"
+            },
+        );
+        settings_editor(
+            ui,
+            &mut app.timezone,
+            &mut app.unlock_duration_minutes,
+            &mut app.windows,
+            &mut app.password_actions,
+        );
+        if !setup {
+            ui.add_space(16.0);
+            vertical_password_editor(
+                ui,
+                "Password for settings",
+                &mut app.passwords.settings_current,
+            );
+            ui.add_space(10.0);
+            if full_primary_button(ui, "Save Settings").clicked() {
+                app.save_settings();
+            }
+        }
+    });
+}
+
+fn unlock_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_title(ui, "Temporary Unlock");
+        vertical_password_editor(ui, "Password", &mut app.passwords.unlock);
+        ui.add_space(8.0);
+        labeled_drag_value(ui, "Duration", &mut app.unlock_request_minutes);
+        ui.add_space(14.0);
+        if full_primary_button(ui, "Unlock Temporarily").clicked() {
+            app.unlock();
+        }
+        if let Some(status) = &app.status {
+            ui.add_space(10.0);
+            if let Some(value) = &status.locked_until {
+                meta_label(ui, format!("Scheduled lock ends: {value}"));
+            }
+            if let Some(value) = &status.unlock_expires_at {
+                meta_label(ui, format!("Temporary unlock expires: {value}"));
+            }
+        }
+    });
+}
+
+fn password_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_title(ui, "Password");
+        vertical_password_editor(ui, "Current password", &mut app.passwords.change_current);
+        ui.add_space(8.0);
+        vertical_password_editor(ui, "New password", &mut app.passwords.new_first);
+        ui.add_space(8.0);
+        vertical_password_editor(ui, "New password again", &mut app.passwords.new_again);
+        ui.add_space(12.0);
+        password_suggestion(ui, app);
+        ui.add_space(10.0);
+        if full_primary_button(ui, "Change Password").clicked() {
+            app.change_password();
+        }
+    });
+}
+
+fn manual_lock_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_title(ui, "Manual Lock");
+        if full_secondary_button(ui, "Clear Temporary Unlock").clicked() {
+            app.manual_lock();
+        }
+    });
+}
+
+fn protection_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
+    section_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_title(ui, "Protection");
+        protection_summary(ui, &app.protection);
+        ui.add_space(12.0);
+        vertical_password_editor(
+            ui,
+            "Password for install",
+            &mut app.passwords.install_current,
+        );
+        ui.add_space(10.0);
+        if full_secondary_button(ui, "Install Hooks & Launchers").clicked() {
+            app.install_protection();
+        }
+        ui.add_space(8.0);
+        if full_secondary_button(ui, "Install Mac App").clicked() {
+            app.install_app_bundle();
+        }
+    });
+}
+
+fn centered_page(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let max_width = 1160.0;
+    let horizontal_margin = 26.0;
+    let target_width = (ui.available_width() - horizontal_margin * 2.0)
+        .max(320.0)
+        .min(max_width);
+    ui.horizontal(|ui| {
+        let side = ((ui.available_width() - target_width) / 2.0).max(0.0);
+        ui.add_space(side);
+        ui.vertical(|ui| {
+            ui.set_width(target_width);
+            ui.add_space(24.0);
+            add_contents(ui);
+            ui.add_space(28.0);
+        });
+    });
+}
+
+fn vertical_password_editor(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    field_label(ui, label);
+    ui.add(
+        egui::TextEdit::singleline(value)
+            .password(true)
+            .desired_width(ui.available_width()),
+    );
+}
+
+fn labeled_drag_value(ui: &mut egui::Ui, label: &str, value: &mut i64) {
+    field_label(ui, label);
+    ui.add(
+        egui::DragValue::new(value)
+            .range(1..=1440)
+            .suffix(" min")
+            .speed(5),
+    );
+}
+
+fn field_label(ui: &mut egui::Ui, label: &str) {
+    ui.label(
+        egui::RichText::new(label)
+            .size(13.0)
+            .strong()
+            .color(rikyunezumi()),
+    );
+}
+
+fn full_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized(
+        [ui.available_width(), 36.0],
+        egui::Button::new(
+            egui::RichText::new(label)
+                .color(button_fg())
+                .strong()
+                .size(14.0),
+        )
+        .fill(aomidori())
+        .stroke(egui::Stroke::new(1.0, aomidori()))
+        .corner_radius(egui::CornerRadius::same(6)),
+    )
+}
+
+fn full_secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized(
+        [ui.available_width(), 34.0],
+        egui::Button::new(
+            egui::RichText::new(label)
+                .color(aomidori())
+                .strong()
+                .size(14.0),
+        )
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::new(1.0, aomidori()))
+        .corner_radius(egui::CornerRadius::same(6)),
+    )
+}
+
+fn compact_secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .color(aomidori())
+                .strong()
+                .size(13.0),
+        )
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::new(1.0, aomidori()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .min_size(egui::vec2(72.0, 28.0)),
+    )
 }
 
 fn settings_editor(
@@ -1119,12 +1298,13 @@ fn settings_editor(
     windows: &mut Vec<WindowDraft>,
     password_actions: &mut Vec<String>,
 ) {
-    subsection_title(ui, "Global Lock Schedule");
+    subsection_title(ui, "Global Curfew");
     let mut remove_index = None;
     let time_options = time_options(windows);
     let can_remove = windows.len() > 1;
     for (index, window) in windows.iter_mut().enumerate() {
         lock_window_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 let label = if index == 0 {
                     "Curfew".to_owned()
@@ -1132,6 +1312,7 @@ fn settings_editor(
                     format!("Extra range {}", index + 1)
                 };
                 ui.label(egui::RichText::new(label).strong().color(sumi()));
+                ui.add_space(6.0);
                 egui::ComboBox::from_id_salt(format!("start-{index}"))
                     .selected_text(&window.start)
                     .width(86.0)
@@ -1149,10 +1330,11 @@ fn settings_editor(
                             ui.selectable_value(&mut window.end, option.clone(), option);
                         }
                     });
-                if can_remove && secondary_button(ui, "Remove").clicked() {
+                if can_remove && compact_secondary_button(ui, "Remove").clicked() {
                     remove_index = Some(index);
                 }
             });
+            ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 for (day_index, day) in DAYS.iter().enumerate() {
                     ui.checkbox(&mut window.days[day_index], *day);
@@ -1163,25 +1345,27 @@ fn settings_editor(
     if let Some(index) = remove_index {
         windows.remove(index);
     }
-    if secondary_button(ui, "Add Time Range").clicked() {
+    ui.add_space(8.0);
+    if full_secondary_button(ui, "Add Time Range").clicked() {
         windows.push(WindowDraft::default());
     }
 
-    ui.add_space(14.0);
+    ui.add_space(18.0);
     subsection_title(ui, "General");
-    form_grid(ui, "general-settings", |ui| {
-        ui.label("Timezone");
-        ui.add(egui::TextEdit::singleline(timezone).desired_width(180.0));
-        ui.end_row();
-        ui.label("Default unlock");
-        ui.add(
-            egui::DragValue::new(unlock_duration_minutes)
-                .range(1..=1440)
-                .suffix(" min"),
-        );
-        ui.end_row();
+    ui.horizontal_wrapped(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(220.0);
+            field_label(ui, "Timezone");
+            ui.add(egui::TextEdit::singleline(timezone).desired_width(200.0));
+        });
+        ui.add_space(10.0);
+        ui.vertical(|ui| {
+            ui.set_width(180.0);
+            labeled_drag_value(ui, "Default unlock", unlock_duration_minutes);
+        });
     });
-    meta_label(ui, "Password required for");
+    ui.add_space(14.0);
+    subsection_title(ui, "Password Gates");
     ui.horizontal_wrapped(|ui| {
         for action in PASSWORD_ACTIONS {
             let mut enabled = password_actions.iter().any(|value| value == action);
@@ -1203,16 +1387,6 @@ fn settings_editor(
             }
         }
     });
-}
-
-fn password_editor(ui: &mut egui::Ui, label: &str, value: &mut String) {
-    ui.label(label);
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .password(true)
-            .desired_width(230.0),
-    );
-    ui.end_row();
 }
 
 fn password_suggestion(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
@@ -1386,14 +1560,6 @@ fn meta_label(ui: &mut egui::Ui, text: impl Into<String>) {
             .color(rikyunezumi())
             .size(13.0),
     );
-}
-
-fn form_grid(ui: &mut egui::Ui, id: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
-    egui::Grid::new(id)
-        .num_columns(2)
-        .spacing(egui::vec2(12.0, 8.0))
-        .min_col_width(118.0)
-        .show(ui, add_contents);
 }
 
 fn section_frame() -> egui::Frame {
@@ -1733,6 +1899,10 @@ enum CommandKind {
         #[arg(long)]
         bin_dir: Option<PathBuf>,
     },
+    InstallApp {
+        #[arg(long)]
+        app_dir: Option<PathBuf>,
+    },
     Launch {
         #[arg(long)]
         agent: String,
@@ -1991,6 +2161,11 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
                     println!("Removed {target} launcher.");
                 }
             }
+            Ok(0)
+        }
+        CommandKind::InstallApp { app_dir } => {
+            let path = install_macos_app_bundle(app_dir.as_deref())?;
+            println!("Installed Prompt Parole app at {}.", path.display());
             Ok(0)
         }
         CommandKind::Launch { agent, real, args } => launch_agent(core, &agent, &real, &args),
@@ -3108,6 +3283,100 @@ fn latest_launcher_backup(dir: &Path, target: &str) -> Result<Option<PathBuf>, S
     Ok(backups.pop())
 }
 
+#[cfg(target_os = "macos")]
+fn install_macos_app_bundle(app_dir: Option<&Path>) -> Result<PathBuf, String> {
+    let root = match app_dir {
+        Some(path) => path.to_path_buf(),
+        None => dirs::home_dir()
+            .map(|home| home.join("Applications"))
+            .ok_or_else(|| "Could not find home directory.".to_owned())?,
+    };
+    fs::create_dir_all(&root)
+        .map_err(|err| format!("Could not create {}: {err}", root.display()))?;
+
+    let app = root.join("Prompt Parole.app");
+    let contents = app.join("Contents");
+    let macos = contents.join("MacOS");
+    let resources = contents.join("Resources");
+    fs::create_dir_all(&macos)
+        .map_err(|err| format!("Could not create {}: {err}", macos.display()))?;
+    fs::create_dir_all(&resources)
+        .map_err(|err| format!("Could not create {}: {err}", resources.display()))?;
+
+    let exe =
+        env::current_exe().map_err(|err| format!("Could not locate current executable: {err}"))?;
+    let bundled_exe = macos.join("prompt-parole");
+    let same_file = fs::canonicalize(&exe).ok() == fs::canonicalize(&bundled_exe).ok();
+    if !same_file {
+        fs::copy(&exe, &bundled_exe).map_err(|err| {
+            format!(
+                "Could not copy {} to {}: {err}",
+                exe.display(),
+                bundled_exe.display()
+            )
+        })?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bundled_exe, fs::Permissions::from_mode(0o755))
+            .map_err(|err| format!("Could not make {} executable: {err}", bundled_exe.display()))?;
+    }
+
+    fs::write(contents.join("Info.plist"), macos_app_info_plist())
+        .map_err(|err| format!("Could not write Info.plist: {err}"))?;
+    fs::write(contents.join("PkgInfo"), "APPL????\n")
+        .map_err(|err| format!("Could not write PkgInfo: {err}"))?;
+    Ok(app)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_macos_app_bundle(app_dir: Option<&Path>) -> Result<PathBuf, String> {
+    let _ = app_dir;
+    Err("macOS app bundle installation is only available on macOS.".to_owned())
+}
+
+fn macos_app_info_plist() -> String {
+    let name = "Prompt Parole";
+    let executable = "prompt-parole";
+    let identifier = "com.prompt-parole.desktop";
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>{name}</string>
+  <key>CFBundleExecutable</key>
+  <string>{executable}</string>
+  <key>CFBundleIdentifier</key>
+  <string>{identifier}</string>
+  <key>CFBundleName</key>
+  <string>{name}</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>{version}</string>
+  <key>CFBundleVersion</key>
+  <string>{version}</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.productivity</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+"#,
+        name = xml_escape(name),
+        executable = xml_escape(executable),
+        identifier = xml_escape(identifier),
+        version = xml_escape(env!("CARGO_PKG_VERSION")),
+    )
+}
+
 fn launch_agent(
     core: &ParoleCore,
     agent: &str,
@@ -3603,6 +3872,17 @@ mod tests {
         assert!(plist.contains("<string>com.prompt-parole.guard-watchdog</string>"));
         assert!(plist.contains("<string>guard-watchdog</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn macos_app_plist_uses_prompt_parole_identity() {
+        let plist = macos_app_info_plist();
+        assert!(plist.contains("<key>CFBundleDisplayName</key>"));
+        assert!(plist.contains("<string>Prompt Parole</string>"));
+        assert!(plist.contains("<key>CFBundleExecutable</key>"));
+        assert!(plist.contains("<string>prompt-parole</string>"));
+        assert!(plist.contains("<key>CFBundlePackageType</key>"));
+        assert!(plist.contains("<string>APPL</string>"));
     }
 
     #[test]
