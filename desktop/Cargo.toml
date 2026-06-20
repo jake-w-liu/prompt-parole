@@ -1,0 +1,14 @@
+[package]
+name = "prompt-parole-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native desktop GUI for Prompt Parole."
+
+[dependencies]
+dirs = "6.0.0"
+eframe = "0.34.3"
+egui = "0.34.3"
+rand = "0.9.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"

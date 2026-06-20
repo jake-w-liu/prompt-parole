@@ -20,8 +20,8 @@ Repository: <https://github.com/jake-w-liu/prompt-parole>
 - Changes the password only after the current password is entered.
 - Saves only a slow password hash, never the password.
 - Logs block/unlock events, but does not log prompt text by default.
-- Provides a local GUI because editing JSON by hand is how "just one more
-  minute" becomes 2:13 AM.
+- Provides a native Rust desktop GUI because editing JSON by hand is how "just
+  one more minute" becomes 2:13 AM.
 
 ## Install
 
@@ -41,6 +41,42 @@ Once the repo is public, this should work too:
 python3 -m pip install git+https://github.com/jake-w-liu/prompt-parole.git
 ```
 
+## Desktop GUI
+
+Prompt Parole includes a native Rust desktop app. It is not a browser page, so
+Google Password Manager and browser-generated-password prompts are not involved.
+The desktop app calls the installed `prompt-parole` CLI, which keeps the hook
+logic and password hashing in one place.
+
+Build and run it from the checkout:
+
+```sh
+cargo run --manifest-path desktop/Cargo.toml
+```
+
+For a release binary:
+
+```sh
+cargo build --release --manifest-path desktop/Cargo.toml
+desktop/target/release/prompt-parole-desktop
+```
+
+If the app cannot find the CLI, set `PROMPT_PAROLE_CLI`:
+
+```sh
+PROMPT_PAROLE_CLI="$HOME/.local/bin/prompt-parole" desktop/target/release/prompt-parole-desktop
+```
+
+The first screen sets the password, default unlock duration, timezone, and lock
+windows. Lock windows are selected with start/end dropdowns and day checkboxes;
+no raw JSON editing is required. After setup, the same app can save settings,
+temporarily unlock prompts, clear a temporary unlock, and change the password.
+
+The "Suggest Local Password" button generates a local password and fills both
+new-password boxes. It does not save it anywhere. If the password is forgotten,
+Prompt Parole has no recovery command; retrieve it from wherever you stored it,
+or the gate will need to be removed outside the app.
+
 ## Daily Use
 
 ```sh
@@ -55,11 +91,12 @@ prompt-parole gui
 The default lock window is every day from `19:00` to `05:00` in your local time
 zone.
 
-`prompt-parole gui` starts a local-only settings page on `127.0.0.1`. Saving
-settings, changing the password, and temporary unlocks all require the current
-password. The GUI uses a restrained traditional Japanese palette inspired by
-Nippon Colors and Sanzo Wada-style color-combination references, because a
-relationship-saving tool should not look like a router admin page.
+`prompt-parole gui` still starts the older local-only browser settings page on
+`127.0.0.1`, but the Rust desktop app is the recommended GUI. Saving settings,
+changing the password, and temporary unlocks all require the current password.
+The GUIs use a restrained traditional Japanese palette inspired by Nippon Colors
+and Sanzo Wada-style color-combination references, because a relationship-saving
+tool should not look like a router admin page.
 
 ## Config
 
