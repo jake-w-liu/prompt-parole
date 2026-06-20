@@ -3,7 +3,7 @@
 Your AI coding assistant is not the problem. The tenth "one tiny follow-up
 prompt" after dinner might be.
 
-Prompt Parole is a local curfew gate for Claude Code and Codex. During your
+Prompt Parole is a Rust curfew gate for Claude Code and Codex. During your
 lock window, new prompts are blocked unless the password is entered through the
 separate `prompt-parole unlock` command or the local GUI. You can still inspect
 files, watch progress, read diffs, and generally look responsible. You just
@@ -18,9 +18,10 @@ Repository: <https://github.com/jake-w-liu/prompt-parole>
   it.
 - Sets the password once with double entry.
 - Changes the password only after the current password is entered.
+- Rejects blank passwords, but does not impose a fixed minimum length.
 - Saves only a slow password hash, never the password.
 - Logs block/unlock events, but does not log prompt text by default.
-- Provides a native Rust desktop GUI because editing JSON by hand is how "just
+- Provides a native desktop GUI because editing JSON by hand is how "just
   one more minute" becomes 2:13 AM.
 
 ## Install
@@ -28,49 +29,42 @@ Repository: <https://github.com/jake-w-liu/prompt-parole>
 From a checkout:
 
 ```sh
-python3 -m pip install -e .
-prompt-parole setup
+cargo build --release --manifest-path desktop/Cargo.toml
+install -m 755 desktop/target/release/prompt-parole "$HOME/.local/bin/prompt-parole"
 prompt-parole install
 ```
 
-After installing hooks, start a new Claude Code or Codex session.
+After installing hooks, restart Claude Code and Codex once so those running
+sessions load the hook command.
 
-Once the repo is public, this should work too:
-
-```sh
-python3 -m pip install git+https://github.com/jake-w-liu/prompt-parole.git
-```
+Once packaging is added, installation can be made friendlier. For now, the
+release binary above is the supported path.
 
 ## Desktop GUI
 
 Prompt Parole includes a native Rust desktop app. It is not a browser page, so
 Google Password Manager and browser-generated-password prompts are not involved.
-The desktop app calls the installed `prompt-parole` CLI, which keeps the hook
-logic and password hashing in one place.
+The desktop app and CLI are the same Rust binary, which keeps the hook logic and
+password hashing in one place.
 
 Build and run it from the checkout:
 
 ```sh
-cargo run --manifest-path desktop/Cargo.toml
+cargo run --manifest-path desktop/Cargo.toml --
 ```
 
 For a release binary:
 
 ```sh
 cargo build --release --manifest-path desktop/Cargo.toml
-desktop/target/release/prompt-parole-desktop
+desktop/target/release/prompt-parole
 ```
 
-If the app cannot find the CLI, set `PROMPT_PAROLE_CLI`:
-
-```sh
-PROMPT_PAROLE_CLI="$HOME/.local/bin/prompt-parole" desktop/target/release/prompt-parole-desktop
-```
-
-The first screen sets the password, default unlock duration, timezone, and lock
-windows. Lock windows are selected with start/end dropdowns and day checkboxes;
-no raw JSON editing is required. After setup, the same app can save settings,
-temporarily unlock prompts, clear a temporary unlock, and change the password.
+The first screen sets the password, default unlock duration, timezone, and
+global lock schedule. The schedule applies to both Claude Code and Codex hooks.
+Times are selected with start/end dropdowns and day checkboxes; no raw JSON
+editing is required. After setup, the same app can save settings, temporarily
+unlock prompts, clear a temporary unlock, and change the password.
 
 The "Suggest Local Password" button generates a local password and fills both
 new-password boxes. It does not save it anywhere. If the password is forgotten,
@@ -91,12 +85,12 @@ prompt-parole gui
 The default lock window is every day from `19:00` to `05:00` in your local time
 zone.
 
-`prompt-parole gui` still starts the older local-only browser settings page on
-`127.0.0.1`, but the Rust desktop app is the recommended GUI. Saving settings,
-changing the password, and temporary unlocks all require the current password.
-The GUIs use a restrained traditional Japanese palette inspired by Nippon Colors
-and Sanzo Wada-style color-combination references, because a relationship-saving
-tool should not look like a router admin page.
+`prompt-parole` with no subcommand opens the native GUI. `prompt-parole gui`
+does the same thing. Saving settings, changing the password, and temporary
+unlocks all require the current password. The GUI uses a restrained traditional
+Japanese palette inspired by Nippon Colors and Sanzo Wada-style
+color-combination references, because a relationship-saving tool should not look
+like a router admin page.
 
 ## Config
 
@@ -118,9 +112,9 @@ The generated config looks like this:
 }
 ```
 
-`unlock`, `passwd`, `configure`, `install`, and `uninstall` are always
-password-gated after setup even if a config edit tries to remove them. The app
-is polite, not gullible.
+`unlock`, `passwd`, and `configure` are always password-gated after setup.
+`install` and `uninstall` are gated by the config; `disable` also gates
+`uninstall`, so the shorter config you suggested can still protect removal.
 
 Lock windows can be written as either:
 
@@ -146,6 +140,14 @@ When locked, the hook emits:
 
 When allowed, it emits nothing and exits successfully.
 
+The hook is evaluated on every prompt by sessions that loaded it. That means a
+session started at 6:30 PM should block its next prompt after a 7:00 PM curfew.
+
+Already-running sessions that predate hook installation cannot be retroactively
+forced to load a hook by editing a config file. Blocking those without restarting
+requires a separate active enforcer that controls or pauses existing processes,
+which is intentionally not enabled by default.
+
 ## Security Model
 
 Prompt Parole has no recovery command. If the password is lost, the app will not
@@ -163,9 +165,10 @@ who owns the laptop and is currently arguing with a shell prompt.
 ## Verification
 
 ```sh
-PYTHONPATH=src python3 -m unittest discover -s tests
-PYTHONPATH=src python3 -m compileall -q src tests
-PYTHONPATH=src python3 -m prompt_parole --help
+cargo test --manifest-path desktop/Cargo.toml
+cargo clippy --manifest-path desktop/Cargo.toml -- -D warnings
+cargo build --release --manifest-path desktop/Cargo.toml
+prompt-parole status --json
 ```
 
 ## Name
