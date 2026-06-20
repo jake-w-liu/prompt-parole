@@ -14,6 +14,9 @@ Repository: <https://github.com/jake-w-liu/prompt-parole>
 ## What It Does
 
 - Blocks Claude Code and Codex prompts during configured hours.
+- Adds a macOS Input Guard for already-open Terminal sessions: it blocks prompt
+  entry/submission keys in focused Codex/Claude tabs while leaving output and
+  navigation visible.
 - Uses `UserPromptSubmit` hooks for prompt-time blocking, so existing output
   and progress stay visible.
 - Can install local launch wrappers so new `codex` and `claude` launches are
@@ -82,6 +85,10 @@ prompt-parole unlock
 prompt-parole lock
 prompt-parole passwd
 prompt-parole configure --lock-window "19:00-05:00 mon,tue,wed,thu,fri,sat,sun"
+prompt-parole guard
+prompt-parole guard --once --json
+prompt-parole guard-agent --action start
+prompt-parole guard-agent --action stop
 prompt-parole gui
 ```
 
@@ -96,9 +103,11 @@ color-combination references, because a relationship-saving tool should not look
 like a router admin page.
 
 The configured desktop view has two columns: schedule and settings on the left,
-current lock state and protection status on the right. Use **Install Hooks &
-Launchers** after entering the current password to install both prompt hooks and
-local `codex`/`claude` launch wrappers.
+current lock state and protection status on the right. Use **Start Input Guard**
+to block typing into the already-open Codex/Claude Terminal tab during curfew.
+Use **Install Hooks & Launchers** after entering the current password to install
+both prompt hooks and local `codex`/`claude` launch wrappers for future
+sessions.
 
 ## Config
 
@@ -162,13 +171,41 @@ Prompt Parole's Codex launcher wrapper starts Codex with hook trust bypass for
 that invocation, then the Prompt Parole hook itself makes the allow/block
 decision.
 
+## Current-Window Input Guard
+
+`prompt-parole guard` is the layer for the exact "I can watch output but cannot
+send another prompt" workflow. On macOS it installs a keyboard event tap and
+polls the focused application. When curfew is active and the focused Terminal
+tab is running `codex`, `claude`, or `claude-code`, prompt-entry keys are
+swallowed before Terminal receives them. The terminal process is not paused, so
+output can continue to render. Navigation keys and system shortcuts are left
+alone so the session does not feel frozen.
+
+You may need to grant macOS Accessibility/Input Monitoring permission to the
+`prompt-parole` binary the first time the guard starts. If macOS refuses the
+event tap, the guard exits with a clear error instead of pretending to protect
+the prompt.
+
+For daily use, start the durable macOS LaunchAgent with:
+
+```sh
+prompt-parole guard-agent --action start
+```
+
+The GUI's **Start Input Guard** button uses the same LaunchAgent path. If macOS
+allows the guard from an interactive Terminal but denies the LaunchAgent event
+tap, Prompt Parole falls back to a visible Terminal guard process instead of
+silently pretending the guard is active.
+
 ## Protection Layers
 
-Prompt Parole has two local layers:
+Prompt Parole has three local layers:
 
-1. **Hooks** block prompt submissions in Claude Code and Codex sessions that have
+1. **Input Guard** blocks prompt-entry keys in the currently focused macOS
+   Codex/Claude Terminal tab during curfew, while output stays visible.
+2. **Hooks** block prompt submissions in Claude Code and Codex sessions that have
    loaded and trusted the hook.
-2. **Launch wrappers** block new `codex` and `claude` process launches during
+3. **Launch wrappers** block new `codex` and `claude` process launches during
    curfew. The wrappers live in `~/.local/bin`, which should appear before
    Homebrew or system binary directories in `PATH`.
 

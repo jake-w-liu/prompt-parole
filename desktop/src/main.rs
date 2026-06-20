@@ -1,7 +1,7 @@
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use constant_time_eq::constant_time_eq;
 use eframe::egui;
 use rand::Rng;
@@ -13,6 +13,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration as StdDuration;
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 const PASSWORD_ACTIONS: [&str; 6] = [
@@ -50,6 +53,15 @@ struct StatusPayload {
     reason: String,
     locked_until: Option<String>,
     unlock_expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GuardStatus {
+    locked: bool,
+    target_focused: bool,
+    blocking_input: bool,
+    foreground: String,
+    detail: String,
 }
 
 #[derive(Clone, Debug)]
@@ -682,6 +694,7 @@ struct ProtectionStatus {
     claude_launcher: bool,
     codex_path_uses_launcher: bool,
     claude_path_uses_launcher: bool,
+    input_guard_running: bool,
 }
 
 struct PromptParoleApp {
@@ -893,6 +906,20 @@ impl PromptParoleApp {
         self.reload();
     }
 
+    fn start_input_guard(&mut self) {
+        self.error.clear();
+        match start_guard_agent(&self.core) {
+            Ok(()) => {
+                self.status_line = "Input guard started.".to_owned();
+                thread::sleep(StdDuration::from_millis(500));
+                self.reload();
+            }
+            Err(err) => {
+                self.error = format!("Could not start input guard: {err}");
+            }
+        }
+    }
+
     fn window_values(&self) -> Result<Vec<String>, String> {
         if self.windows.is_empty() {
             return Err("At least one lock window is required.".to_owned());
@@ -1017,10 +1044,13 @@ impl PromptParoleApp {
                         ui.add_space(10.0);
                         protection_summary(ui, &self.protection);
                         ui.add_space(10.0);
+                        if primary_button(ui, "Start Input Guard").clicked() {
+                            self.start_input_guard();
+                        }
                         if secondary_button(ui, "Install Hooks & Launchers").clicked() {
                             self.install_protection();
                         }
-                        meta_label(ui, "Reopen Codex or Claude through the protected launcher after installing. Output remains visible; new prompts are blocked.");
+                        meta_label(ui, "Input Guard blocks this already-open Terminal prompt while keeping output visible. Hooks and launchers protect reopened sessions.");
                     });
 
                     ui.add_space(14.0);
@@ -1277,6 +1307,14 @@ fn status_summary(ui: &mut egui::Ui, status: &StatusPayload) {
 }
 
 fn protection_summary(ui: &mut egui::Ui, protection: &ProtectionStatus) {
+    subsection_title(ui, "Current Window");
+    protection_row(
+        ui,
+        "Input guard",
+        protection.input_guard_running,
+        "blocks keys in focused Codex/Claude terminal tabs",
+    );
+    ui.add_space(8.0);
     subsection_title(ui, "Prompt Gate");
     protection_row(
         ui,
@@ -1596,6 +1634,13 @@ struct Cli {
     command: Option<CommandKind>,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum GuardAgentAction {
+    Start,
+    Stop,
+    Status,
+}
+
 #[derive(Subcommand)]
 enum CommandKind {
     Setup {
@@ -1644,6 +1689,18 @@ enum CommandKind {
     Hook {
         #[arg(long)]
         agent: String,
+    },
+    Guard {
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 150)]
+        poll_millis: u64,
+    },
+    GuardAgent {
+        #[arg(long, value_enum, default_value = "start")]
+        action: GuardAgentAction,
     },
     Install {
         #[arg(long)]
@@ -1812,6 +1869,57 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
                     println!(
                         "{}",
                         serde_json::json!({"decision": "block", "reason": format!("Prompt Parole configuration error: {err}")})
+                    );
+                }
+            }
+            Ok(0)
+        }
+        CommandKind::Guard {
+            once,
+            json,
+            poll_millis,
+        } => {
+            if once {
+                let status = input_guard_status(core)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&status).map_err(|err| err.to_string())?
+                    );
+                } else {
+                    println!(
+                        "{}: {} ({})",
+                        if status.blocking_input {
+                            "blocking"
+                        } else {
+                            "not blocking"
+                        },
+                        status.foreground,
+                        status.detail
+                    );
+                }
+                return Ok(if status.blocking_input { 1 } else { 0 });
+            }
+            run_input_guard(core.clone(), poll_millis)
+        }
+        CommandKind::GuardAgent { action } => {
+            match action {
+                GuardAgentAction::Start => {
+                    start_guard_agent(core)?;
+                    println!("Input guard agent started.");
+                }
+                GuardAgentAction::Stop => {
+                    stop_guard_agent(core)?;
+                    println!("Input guard agent stopped.");
+                }
+                GuardAgentAction::Status => {
+                    println!(
+                        "{}",
+                        if input_guard_running() {
+                            "running"
+                        } else {
+                            "stopped"
+                        }
                     );
                 }
             }
@@ -2016,6 +2124,625 @@ fn parse_targets(raw: &str) -> Result<Vec<String>, String> {
     Ok(targets)
 }
 
+static INPUT_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+const GUARD_FLAG_CONTROL: u64 = 1 << 18;
+const GUARD_FLAG_OPTION: u64 = 1 << 19;
+const GUARD_FLAG_COMMAND: u64 = 1 << 20;
+const GUARD_KEY_V: i64 = 9;
+const GUARD_KEY_J: i64 = 38;
+const GUARD_KEY_M: i64 = 46;
+const GUARD_KEY_RETURN: i64 = 36;
+const GUARD_KEY_ENTER: i64 = 76;
+
+fn should_block_guard_key(key_code: i64, flags: u64) -> bool {
+    if key_code == GUARD_KEY_RETURN || key_code == GUARD_KEY_ENTER {
+        return true;
+    }
+    if flags & GUARD_FLAG_COMMAND != 0 {
+        return key_code == GUARD_KEY_V;
+    }
+    if flags & GUARD_FLAG_CONTROL != 0 {
+        return key_code == GUARD_KEY_J || key_code == GUARD_KEY_M;
+    }
+    if flags & GUARD_FLAG_OPTION != 0 {
+        return is_text_entry_key_code(key_code);
+    }
+    is_text_entry_key_code(key_code)
+}
+
+fn is_text_entry_key_code(key_code: i64) -> bool {
+    matches!(
+        key_code,
+        0..=50
+            | 51
+            | 65
+            | 67
+            | 69
+            | 75
+            | 78
+            | 81
+            | 82..=89
+            | 91
+            | 92
+            | 117
+    )
+}
+
+fn input_guard_status(core: &ParoleCore) -> Result<GuardStatus, String> {
+    let decision = if core.is_configured() {
+        core.decision()?
+    } else {
+        Decision {
+            allowed: true,
+            scheduled_locked: false,
+            temporarily_unlocked: false,
+            reason: "not configured".to_owned(),
+            locked_until: None,
+            unlock_expires_at: None,
+        }
+    };
+    let foreground = foreground_target()?;
+    let locked = !decision.allowed;
+    let blocking_input = locked && foreground.target_focused;
+    Ok(GuardStatus {
+        locked,
+        target_focused: foreground.target_focused,
+        blocking_input,
+        foreground: foreground.name,
+        detail: if blocking_input {
+            "curfew active and focused window is a prompt target".to_owned()
+        } else if locked {
+            "curfew active but focused window is not a prompt target".to_owned()
+        } else {
+            decision.reason
+        },
+    })
+}
+
+fn run_input_guard(core: ParoleCore, poll_millis: u64) -> Result<i32, String> {
+    if poll_millis < 50 {
+        return Err("poll-millis must be at least 50.".to_owned());
+    }
+    println!("Prompt Parole input guard is running.");
+    println!("Output remains visible; keyboard input to locked Codex/Claude windows is blocked.");
+    let initial_blocking = input_guard_status(&core)
+        .map(|status| status.blocking_input)
+        .unwrap_or(false);
+    INPUT_BLOCKED.store(initial_blocking, Ordering::Relaxed);
+    let poll_core = core.clone();
+    thread::spawn(move || {
+        loop {
+            let blocking = input_guard_status(&poll_core)
+                .map(|status| status.blocking_input)
+                .unwrap_or(false);
+            INPUT_BLOCKED.store(blocking, Ordering::Relaxed);
+            thread::sleep(StdDuration::from_millis(poll_millis));
+        }
+    });
+    platform_run_input_guard()
+}
+
+#[derive(Clone, Debug)]
+struct ForegroundTarget {
+    name: String,
+    target_focused: bool,
+}
+
+fn foreground_target() -> Result<ForegroundTarget, String> {
+    platform_foreground_target()
+}
+
+fn input_guard_running() -> bool {
+    !guard_process_pids().is_empty()
+}
+
+const GUARD_AGENT_LABEL: &str = "com.prompt-parole.guard";
+
+fn start_guard_agent(core: &ParoleCore) -> Result<(), String> {
+    if input_guard_running() {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let plist = guard_agent_plist_path()?;
+        write_guard_agent_plist(core, &plist)?;
+        let domain = launchctl_domain()?;
+        let target = launchctl_target(&domain);
+        let _ = run_launchctl(&["bootout", &target]);
+        run_launchctl(&["bootstrap", &domain, plist.to_string_lossy().as_ref()])?;
+        run_launchctl(&["kickstart", "-k", &target])?;
+        thread::sleep(StdDuration::from_millis(900));
+        if input_guard_running() {
+            return Ok(());
+        }
+        let _ = run_launchctl(&["bootout", &target]);
+        start_terminal_guard()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = core;
+        Err("Input Guard agent is currently implemented only for macOS.".to_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn start_terminal_guard() -> Result<(), String> {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("prompt-parole"));
+    let command = format!("{} guard", shell_quote(&exe.to_string_lossy()));
+    let script = format!(
+        "tell application \"Terminal\" to do script \"{}\"",
+        applescript_string_escape(&command)
+    );
+    let output = Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|err| format!("Could not start Terminal input guard: {err}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    thread::sleep(StdDuration::from_millis(900));
+    if input_guard_running() {
+        Ok(())
+    } else {
+        Err("Input guard did not stay running. Check macOS Accessibility/Input Monitoring permission for Terminal or prompt-parole.".to_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn applescript_string_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn stop_guard_agent(core: &ParoleCore) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = core;
+        let target = launchctl_target(&launchctl_domain()?);
+        let result = run_launchctl(&["bootout", &target]).or_else(|err| {
+            if err.contains("No such process") || err.contains("Could not find service") {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        });
+        stop_guard_processes();
+        result
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = core;
+        Err("Input Guard agent is currently implemented only for macOS.".to_owned())
+    }
+}
+
+fn stop_guard_processes() {
+    for pid in guard_process_pids() {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+}
+
+fn guard_process_pids() -> Vec<u32> {
+    let Ok(output) = Command::new("ps").args(["-axo", "pid=,args="]).output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let self_pid = std::process::id().to_string();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| parse_guard_process_line(line, &self_pid))
+        .collect()
+}
+
+fn parse_guard_process_line(line: &str, self_pid: &str) -> Option<u32> {
+    let mut parts = line.trim_start().splitn(2, char::is_whitespace);
+    let pid = parts.next()?;
+    if pid == self_pid {
+        return None;
+    }
+    let args = parts.next().unwrap_or("");
+    let mut arg_parts = args.split_whitespace();
+    let exe = arg_parts.next()?;
+    let exe_name = Path::new(exe).file_name()?.to_str()?;
+    if exe_name != "prompt-parole" {
+        return None;
+    }
+    arg_parts
+        .any(|arg| arg == "guard")
+        .then(|| pid.parse().ok())?
+}
+
+fn guard_agent_plist_path() -> Result<PathBuf, String> {
+    dirs::home_dir()
+        .map(|home| {
+            home.join("Library")
+                .join("LaunchAgents")
+                .join(format!("{GUARD_AGENT_LABEL}.plist"))
+        })
+        .ok_or_else(|| "Could not find home directory.".to_owned())
+}
+
+fn write_guard_agent_plist(core: &ParoleCore, path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory.", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+    ensure_private_dir(&core.app_dir)?;
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("prompt-parole"));
+    let log = core.app_dir.join("guard.log");
+    let err = core.app_dir.join("guard.err.log");
+    let plist = guard_agent_plist(&exe, &log, &err);
+    fs::write(path, plist).map_err(|err| format!("Could not write {}: {err}", path.display()))?;
+    Ok(())
+}
+
+fn guard_agent_plist(exe: &Path, stdout: &Path, stderr: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+    <string>guard</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{stdout}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr}</string>
+</dict>
+</plist>
+"#,
+        label = GUARD_AGENT_LABEL,
+        exe = xml_escape(&exe.to_string_lossy()),
+        stdout = xml_escape(&stdout.to_string_lossy()),
+        stderr = xml_escape(&stderr.to_string_lossy())
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn launchctl_domain() -> Result<String, String> {
+    let output = Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|err| format!("Could not determine user id: {err}"))?;
+    if !output.status.success() {
+        return Err("Could not determine user id.".to_owned());
+    }
+    Ok(format!(
+        "gui/{}",
+        String::from_utf8_lossy(&output.stdout).trim()
+    ))
+}
+
+fn launchctl_target(domain: &str) -> String {
+    format!("{domain}/{GUARD_AGENT_LABEL}")
+}
+
+fn run_launchctl(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("launchctl")
+        .args(args)
+        .output()
+        .map_err(|err| format!("Could not run launchctl: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Err(if stderr.is_empty() {
+        format!("launchctl {:?} failed: {stdout}", args)
+    } else {
+        format!("launchctl {:?} failed: {stderr}", args)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn platform_foreground_target() -> Result<ForegroundTarget, String> {
+    let Some(window) = macos_front_window::frontmost_window() else {
+        return Ok(ForegroundTarget {
+            name: "no foreground window".to_owned(),
+            target_focused: false,
+        });
+    };
+    let name = if window.title.is_empty() {
+        window.owner.clone()
+    } else {
+        format!("{}: {}", window.owner, window.title)
+    };
+    Ok(ForegroundTarget {
+        target_focused: window_is_agent_target(&window.owner, &window.title),
+        name,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_foreground_target() -> Result<ForegroundTarget, String> {
+    Ok(ForegroundTarget {
+        name: "unsupported platform".to_owned(),
+        target_focused: false,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn platform_run_input_guard() -> Result<i32, String> {
+    macos_event_tap::run()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_run_input_guard() -> Result<i32, String> {
+    Err("Input Guard is currently implemented only for macOS.".to_owned())
+}
+
+fn window_is_agent_target(owner: &str, title: &str) -> bool {
+    let owner = owner.to_ascii_lowercase();
+    let title = title.to_ascii_lowercase();
+    if owner.contains("codex") || owner.contains("claude") {
+        return true;
+    }
+    owner == "terminal" && (title.contains("codex") || title.contains("claude"))
+}
+
+#[cfg(target_os = "macos")]
+mod macos_front_window {
+    use std::ffi::{c_char, c_void};
+
+    type CfArrayRef = *const c_void;
+    type CfDictionaryRef = *const c_void;
+    type CfStringRef = *const c_void;
+    type CfNumberRef = *const c_void;
+    type CfIndex = isize;
+
+    const K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1;
+    const K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS: u32 = 16;
+    const K_CF_NUMBER_INT_TYPE: u32 = 9;
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    #[derive(Clone, Debug)]
+    pub struct WindowInfo {
+        pub owner: String,
+        pub title: String,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        static kCGWindowOwnerName: CfStringRef;
+        static kCGWindowName: CfStringRef;
+        static kCGWindowLayer: CfStringRef;
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CfArrayRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(array: CfArrayRef) -> CfIndex;
+        fn CFArrayGetValueAtIndex(array: CfArrayRef, index: CfIndex) -> *const c_void;
+        fn CFDictionaryGetValue(dict: CfDictionaryRef, key: *const c_void) -> *const c_void;
+        fn CFNumberGetValue(number: CfNumberRef, number_type: u32, value_ptr: *mut c_void) -> bool;
+        fn CFStringGetCString(
+            string: CfStringRef,
+            buffer: *mut c_char,
+            buffer_size: CfIndex,
+            encoding: u32,
+        ) -> bool;
+        fn CFRelease(value: *const c_void);
+    }
+
+    pub fn frontmost_window() -> Option<WindowInfo> {
+        unsafe {
+            let list = CGWindowListCopyWindowInfo(
+                K_CG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY | K_CG_WINDOW_LIST_EXCLUDE_DESKTOP_ELEMENTS,
+                0,
+            );
+            if list.is_null() {
+                return None;
+            }
+            let count = CFArrayGetCount(list);
+            let mut result = None;
+            for index in 0..count {
+                let dict = CFArrayGetValueAtIndex(list, index) as CfDictionaryRef;
+                if dict.is_null() || window_layer(dict) != Some(0) {
+                    continue;
+                }
+                let owner = dictionary_string(dict, kCGWindowOwnerName).unwrap_or_default();
+                if owner.is_empty()
+                    || matches!(
+                        owner.as_str(),
+                        "Window Server"
+                            | "Dock"
+                            | "Control Center"
+                            | "Notification Center"
+                            | "SystemUIServer"
+                    )
+                {
+                    continue;
+                }
+                let title = dictionary_string(dict, kCGWindowName).unwrap_or_default();
+                result = Some(WindowInfo { owner, title });
+                break;
+            }
+            CFRelease(list);
+            result
+        }
+    }
+
+    unsafe fn window_layer(dict: CfDictionaryRef) -> Option<i32> {
+        let value = unsafe { CFDictionaryGetValue(dict, kCGWindowLayer) as CfNumberRef };
+        if value.is_null() {
+            return None;
+        }
+        let mut layer = 0_i32;
+        let ok = unsafe {
+            CFNumberGetValue(
+                value,
+                K_CF_NUMBER_INT_TYPE,
+                (&mut layer as *mut i32).cast::<c_void>(),
+            )
+        };
+        ok.then_some(layer)
+    }
+
+    unsafe fn dictionary_string(dict: CfDictionaryRef, key: CfStringRef) -> Option<String> {
+        let value = unsafe { CFDictionaryGetValue(dict, key) as CfStringRef };
+        if value.is_null() {
+            return None;
+        }
+        unsafe { cf_string(value) }
+    }
+
+    unsafe fn cf_string(value: CfStringRef) -> Option<String> {
+        let mut buffer = [0_i8; 1024];
+        let ok = unsafe {
+            CFStringGetCString(
+                value,
+                buffer.as_mut_ptr(),
+                buffer.len() as CfIndex,
+                K_CF_STRING_ENCODING_UTF8,
+            )
+        };
+        if !ok {
+            return None;
+        }
+        let len = buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(buffer.len());
+        let bytes = buffer[..len]
+            .iter()
+            .map(|byte| *byte as u8)
+            .collect::<Vec<_>>();
+        String::from_utf8(bytes).ok()
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_event_tap {
+    use super::{INPUT_BLOCKED, should_block_guard_key};
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::Duration;
+
+    type CgEventTapProxy = *mut c_void;
+    type CgEventRef = *mut c_void;
+    type CfMachPortRef = *mut c_void;
+    type CfRunLoopSourceRef = *mut c_void;
+    type CfRunLoopRef = *mut c_void;
+    type CfAllocatorRef = *const c_void;
+    type CfStringRef = *const c_void;
+    type CgEventTapCallback =
+        extern "C" fn(CgEventTapProxy, u32, CgEventRef, *mut c_void) -> CgEventRef;
+
+    const K_CG_SESSION_EVENT_TAP: u32 = 1;
+    const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+    const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
+    const K_CG_EVENT_KEY_DOWN: u32 = 10;
+    const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventTapCreate(
+            tap: u32,
+            place: u32,
+            options: u32,
+            events_of_interest: u64,
+            callback: CgEventTapCallback,
+            user_info: *mut c_void,
+        ) -> CfMachPortRef;
+        fn CGEventTapEnable(tap: CfMachPortRef, enable: bool);
+        fn CGEventGetIntegerValueField(event: CgEventRef, field: u32) -> i64;
+        fn CGEventGetFlags(event: CgEventRef) -> u64;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFRunLoopCommonModes: CfStringRef;
+        static kCFRunLoopDefaultMode: CfStringRef;
+        fn CFMachPortCreateRunLoopSource(
+            allocator: CfAllocatorRef,
+            port: CfMachPortRef,
+            order: isize,
+        ) -> CfRunLoopSourceRef;
+        fn CFRunLoopGetCurrent() -> CfRunLoopRef;
+        fn CFRunLoopAddSource(rl: CfRunLoopRef, source: CfRunLoopSourceRef, mode: CfStringRef);
+        fn CFRunLoopRunInMode(
+            mode: CfStringRef,
+            seconds: f64,
+            return_after_source_handled: bool,
+        ) -> i32;
+    }
+
+    extern "C" fn event_callback(
+        _proxy: CgEventTapProxy,
+        event_type: u32,
+        event: CgEventRef,
+        _user_info: *mut c_void,
+    ) -> CgEventRef {
+        if event_type == K_CG_EVENT_KEY_DOWN && INPUT_BLOCKED.load(Ordering::Relaxed) {
+            let key_code =
+                unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
+            let flags = unsafe { CGEventGetFlags(event) };
+            if should_block_guard_key(key_code, flags) {
+                return ptr::null_mut();
+            }
+        }
+        event
+    }
+
+    pub fn run() -> Result<i32, String> {
+        let mask = 1_u64 << K_CG_EVENT_KEY_DOWN;
+        unsafe {
+            let tap = CGEventTapCreate(
+                K_CG_SESSION_EVENT_TAP,
+                K_CG_HEAD_INSERT_EVENT_TAP,
+                K_CG_EVENT_TAP_OPTION_DEFAULT,
+                mask,
+                event_callback,
+                ptr::null_mut(),
+            );
+            if tap.is_null() {
+                return Err(
+                    "Could not create macOS keyboard event tap. Grant Accessibility/Input Monitoring permission to prompt-parole, then start Input Guard again."
+                        .to_owned(),
+                );
+            }
+            let source = CFMachPortCreateRunLoopSource(ptr::null(), tap, 0);
+            if source.is_null() {
+                return Err("Could not create macOS event-tap run loop source.".to_owned());
+            }
+            let run_loop = CFRunLoopGetCurrent();
+            CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode);
+            CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
+            CGEventTapEnable(tap, true);
+            loop {
+                CGEventTapEnable(tap, true);
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 3600.0, false);
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+}
+
 fn protection_status() -> ProtectionStatus {
     ProtectionStatus {
         codex_hook: hook_installed("codex"),
@@ -2024,6 +2751,7 @@ fn protection_status() -> ProtectionStatus {
         claude_launcher: launcher_installed("claude"),
         codex_path_uses_launcher: command_uses_launcher("codex"),
         claude_path_uses_launcher: command_uses_launcher("claude"),
+        input_guard_running: input_guard_running(),
     }
 }
 
@@ -2691,6 +3419,88 @@ mod tests {
         let script = fs::read_to_string(wrapper).unwrap();
         assert!(script.contains("launch --agent codex"));
         assert!(script.contains("--real /opt/homebrew/bin/codex"));
+    }
+
+    #[test]
+    fn input_guard_blocks_prompt_entry_but_allows_navigation_keys() {
+        assert!(should_block_guard_key(0, 0));
+        assert!(should_block_guard_key(GUARD_KEY_RETURN, 0));
+        assert!(should_block_guard_key(GUARD_KEY_ENTER, 0));
+        assert!(should_block_guard_key(GUARD_KEY_V, GUARD_FLAG_COMMAND));
+        assert!(should_block_guard_key(GUARD_KEY_J, GUARD_FLAG_CONTROL));
+        assert!(should_block_guard_key(GUARD_KEY_M, GUARD_FLAG_CONTROL));
+        assert!(should_block_guard_key(0, GUARD_FLAG_OPTION));
+
+        assert!(!should_block_guard_key(8, GUARD_FLAG_COMMAND));
+        assert!(!should_block_guard_key(8, GUARD_FLAG_CONTROL));
+        assert!(!should_block_guard_key(53, 0));
+        assert!(!should_block_guard_key(123, 0));
+        assert!(!should_block_guard_key(124, 0));
+    }
+
+    #[test]
+    fn guard_agent_plist_escapes_paths_and_keeps_label() {
+        let plist = guard_agent_plist(
+            Path::new("/tmp/prompt&parole"),
+            Path::new("/tmp/out<log>"),
+            Path::new("/tmp/err\"log\""),
+        );
+
+        assert!(plist.contains("<string>com.prompt-parole.guard</string>"));
+        assert!(plist.contains("<string>/tmp/prompt&amp;parole</string>"));
+        assert!(plist.contains("<string>/tmp/out&lt;log&gt;</string>"));
+        assert!(plist.contains("<string>/tmp/err&quot;log&quot;</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn front_window_matching_targets_terminal_agent_titles() {
+        assert!(window_is_agent_target(
+            "Terminal",
+            "pb -- pb -- codex -- 131x35"
+        ));
+        assert!(window_is_agent_target(
+            "Terminal",
+            "work -- claude -- 100x40"
+        ));
+        assert!(window_is_agent_target("Codex", "workspace"));
+        assert!(!window_is_agent_target("Terminal", "plain zsh"));
+        assert!(!window_is_agent_target("Google Chrome", "codex docs"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn applescript_escape_handles_quotes_and_backslashes() {
+        assert_eq!(
+            applescript_string_escape(r#"/tmp/prompt "parole" \ guard"#),
+            r#"/tmp/prompt \"parole\" \\ guard"#
+        );
+    }
+
+    #[test]
+    fn guard_process_parser_matches_only_real_guard_command() {
+        assert_eq!(
+            parse_guard_process_line("123 /Users/jake/.local/bin/prompt-parole guard", "999"),
+            Some(123)
+        );
+        assert_eq!(
+            parse_guard_process_line(
+                "124 /Users/jake/.local/bin/prompt-parole guard-agent --action stop",
+                "999"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_guard_process_line(
+                "125 /bin/zsh -c /Users/jake/.local/bin/prompt-parole guard",
+                "999"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_guard_process_line("126 /Users/jake/.local/bin/prompt-parole guard", "126"),
+            None
+        );
     }
 
     #[test]
