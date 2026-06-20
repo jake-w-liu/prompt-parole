@@ -289,9 +289,7 @@ impl ParoleCore {
     }
 
     fn hook_payload(&self, agent: &str) -> Result<Option<serde_json::Value>, String> {
-        if agent != "codex" && agent != "claude-code" {
-            return Err(format!("Unsupported agent {agent:?}."));
-        }
+        let agent = normalized_hook_agent(agent)?;
         if !self.is_configured() {
             return Ok(None);
         }
@@ -315,6 +313,14 @@ impl ParoleCore {
             payload["suppressOriginalPrompt"] = serde_json::Value::Bool(true);
         }
         Ok(Some(payload))
+    }
+}
+
+fn normalized_hook_agent(agent: &str) -> Result<&'static str, String> {
+    match agent {
+        "codex" => Ok("codex"),
+        "claude" | "claude-code" => Ok("claude-code"),
+        _ => Err(format!("Unsupported agent {agent:?}.")),
     }
 }
 
@@ -757,6 +763,7 @@ struct PromptParoleApp {
     generated_password: String,
     protection: ProtectionStatus,
     active_tab: AppTab,
+    viewport_normalized: bool,
 }
 
 impl PromptParoleApp {
@@ -785,6 +792,7 @@ impl PromptParoleApp {
             generated_password: String::new(),
             protection: ProtectionStatus::default(),
             active_tab: initial_app_tab(),
+            viewport_normalized: false,
         };
         app.reload();
         app
@@ -1005,6 +1013,10 @@ impl PromptParoleApp {
 impl eframe::App for PromptParoleApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         apply_style(ui.ctx());
+        if !self.viewport_normalized {
+            normalize_gui_viewport(ui.ctx());
+            self.viewport_normalized = true;
+        }
         egui::Frame::new()
             .fill(shironeri())
             .inner_margin(0)
@@ -1036,6 +1048,17 @@ impl eframe::App for PromptParoleApp {
                     });
             });
     }
+}
+
+fn normalize_gui_viewport(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+        620.0, 400.0,
+    )));
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(760.0, 460.0)));
+    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+        120.0, 90.0,
+    )));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
 }
 
 impl PromptParoleApp {
@@ -2622,12 +2645,23 @@ fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, St
             .unwrap_or(false);
         if locked
             && !input_guard_running()
-            && let Err(err) = start_guard_once(&core)
+            && let Err(err) = recover_guard_from_watchdog(&core)
         {
             eprintln!("prompt-parole watchdog: could not start input guard: {err}");
         }
         thread::sleep(StdDuration::from_secs(interval_seconds));
     }
+}
+
+#[cfg(target_os = "macos")]
+fn recover_guard_from_watchdog(core: &ParoleCore) -> Result<(), String> {
+    let _ = core;
+    start_terminal_guard()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn recover_guard_from_watchdog(core: &ParoleCore) -> Result<(), String> {
+    start_guard_once(core)
 }
 
 #[cfg(target_os = "macos")]
@@ -2752,7 +2786,7 @@ fn write_guard_watchdog_plist(core: &ParoleCore, path: &Path) -> Result<(), Stri
         core,
         path,
         GUARD_WATCHDOG_LABEL,
-        &["guard-watchdog"],
+        &["guard-watchdog", "--interval-seconds", "2"],
         "guard-watchdog",
     )
 }
@@ -3213,7 +3247,9 @@ fn prompt_parole_hook_installed(path: &Path, agent: &str) -> bool {
 fn is_prompt_parole_hook_command(command: &str, agent: &str) -> bool {
     let has_marker =
         command.contains("PROMPT_PAROLE_HOOK=1") || command.contains("prompt-parole hook --agent");
-    has_marker && command.contains(&format!("--agent {agent}"))
+    has_marker
+        && (command.contains(&format!("--agent {agent}"))
+            || (agent == "claude-code" && command.contains("--agent claude")))
 }
 
 fn launcher_installed(target: &str) -> bool {
@@ -3310,6 +3346,18 @@ fn locate_real_agent_binary(target: &str, wrapper: &Path) -> Result<PathBuf, Str
         return Ok(path);
     }
 
+    let output = Command::new("which")
+        .args(["-a", target])
+        .output()
+        .map_err(|err| format!("Could not find {target}: {err}"))?;
+    if output.status.success()
+        && let Some(path) =
+            first_real_agent_candidate(String::from_utf8_lossy(&output.stdout).lines(), wrapper)
+    {
+        return fs::canonicalize(&path)
+            .map_err(|err| format!("Could not resolve {}: {err}", path.display()));
+    }
+
     let known = if target == "codex" {
         vec![
             PathBuf::from("/opt/homebrew/bin/codex"),
@@ -3330,23 +3378,24 @@ fn locate_real_agent_binary(target: &str, wrapper: &Path) -> Result<PathBuf, Str
         }
     }
 
-    let output = Command::new("which")
-        .args(["-a", target])
-        .output()
-        .map_err(|err| format!("Could not find {target}: {err}"))?;
-    if output.status.success() {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let path = PathBuf::from(line.trim());
-            if path == wrapper || is_prompt_parole_launcher(&path) {
-                continue;
-            }
-            if path.exists() {
-                return fs::canonicalize(&path)
-                    .map_err(|err| format!("Could not resolve {}: {err}", path.display()));
-            }
-        }
-    }
     Err(format!("Could not find the real {target} binary."))
+}
+
+fn first_real_agent_candidate<'a>(
+    candidates: impl IntoIterator<Item = &'a str>,
+    wrapper: &Path,
+) -> Option<PathBuf> {
+    candidates.into_iter().find_map(|line| {
+        let clean = line.trim();
+        if clean.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(clean);
+        if path == wrapper || is_prompt_parole_launcher(&path) {
+            return None;
+        }
+        path.exists().then_some(path)
+    })
 }
 
 fn write_launcher_script(
@@ -3730,6 +3779,8 @@ fn run_gui() -> eframe::Result {
             .with_title("Prompt Parole")
             .with_inner_size([760.0, 460.0])
             .with_min_inner_size([620.0, 400.0]),
+        centered: true,
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -3877,6 +3928,30 @@ mod tests {
     }
 
     #[test]
+    fn claude_hook_accepts_legacy_agent_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = ParoleCore {
+            app_dir: dir.path().to_path_buf(),
+        };
+        core.setup(
+            "ok",
+            vec!["00:00-23:59 mon,tue,wed,thu,fri,sat,sun".to_owned()],
+            "local".to_owned(),
+            30,
+            PASSWORD_ACTIONS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        )
+        .unwrap();
+
+        let payload = core.hook_payload("claude").unwrap().unwrap();
+
+        assert_eq!(payload["decision"], "block");
+        assert_eq!(payload["suppressOriginalPrompt"], true);
+    }
+
+    #[test]
     fn install_and_uninstall_hook_preserve_other_hooks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hooks.json");
@@ -3941,6 +4016,29 @@ mod tests {
     }
 
     #[test]
+    fn hook_status_accepts_legacy_claude_agent_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        write_json_atomic(
+            &path,
+            &serde_json::json!({
+                "hooks": {
+                    "UserPromptSubmit": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "PROMPT_PAROLE_HOOK=1 /tmp/prompt-parole hook --agent claude",
+                            "timeout": 5
+                        }]
+                    }]
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(prompt_parole_hook_installed(&path, "claude-code"));
+    }
+
+    #[test]
     fn launcher_script_is_marked_as_prompt_parole_launcher() {
         let dir = tempfile::tempdir().unwrap();
         let wrapper = dir.path().join("codex");
@@ -3956,6 +4054,32 @@ mod tests {
         let script = fs::read_to_string(wrapper).unwrap();
         assert!(script.contains("launch --agent codex"));
         assert!(script.contains("--real /opt/homebrew/bin/codex"));
+    }
+
+    #[test]
+    fn real_agent_candidate_respects_path_order_and_skips_wrappers() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("codex");
+        let launcher = dir.path().join("launcher-codex");
+        let real = dir.path().join("real-codex");
+        write_launcher_script(
+            &launcher,
+            Path::new("/tmp/prompt-parole"),
+            "codex",
+            Path::new("/opt/homebrew/bin/codex"),
+        )
+        .unwrap();
+        fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+        fs::write(&real, "#!/bin/sh\n").unwrap();
+
+        let lines = [
+            wrapper.to_string_lossy().to_string(),
+            launcher.to_string_lossy().to_string(),
+            real.to_string_lossy().to_string(),
+        ];
+        let selected = first_real_agent_candidate(lines.iter().map(String::as_str), &wrapper);
+
+        assert_eq!(selected, Some(real));
     }
 
     #[test]
@@ -3997,13 +4121,15 @@ mod tests {
         let plist = launch_agent_plist(
             GUARD_WATCHDOG_LABEL,
             Path::new("/tmp/prompt-parole"),
-            &["guard-watchdog"],
+            &["guard-watchdog", "--interval-seconds", "2"],
             Path::new("/tmp/watchdog.log"),
             Path::new("/tmp/watchdog.err.log"),
         );
 
         assert!(plist.contains("<string>com.prompt-parole.guard-watchdog</string>"));
         assert!(plist.contains("<string>guard-watchdog</string>"));
+        assert!(plist.contains("<string>--interval-seconds</string>"));
+        assert!(plist.contains("<string>2</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
     }
 
