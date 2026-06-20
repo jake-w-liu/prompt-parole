@@ -63,6 +63,7 @@ class PromptParole:
     ) -> None:
         if self.secret_file.exists():
             raise PasswordError("Prompt Parole is already configured. Use `prompt-parole passwd` to change the password.")
+        secret = hash_password(password)
         config = normalize_config(DEFAULT_CONFIG)
         if lock_windows is not None:
             config["lock_windows"] = [parse_window(window) for window in lock_windows]
@@ -74,7 +75,7 @@ class PromptParole:
             config["password_required_for"] = password_required_for
         config = normalize_config(config)
         write_json_atomic(self.config_file, config, mode=0o600)
-        write_json_atomic(self.secret_file, hash_password(password), mode=0o600)
+        write_json_atomic(self.secret_file, secret, mode=0o600)
         write_json_atomic(self.state_file, {"version": 1, "unlock_expires_at": None, "updated_at": now_iso()}, mode=0o600)
         append_event(self.events_file, {"event": "setup"})
 
@@ -115,7 +116,7 @@ class PromptParole:
     def unlock(self, password: str, *, duration_minutes: int | None = None) -> datetime:
         self.assert_password(password)
         config = self.load_config()
-        minutes = duration_minutes or int(config["unlock_duration_minutes"])
+        minutes = duration_minutes if duration_minutes is not None else int(config["unlock_duration_minutes"])
         if minutes <= 0:
             raise ValueError("Unlock duration must be positive.")
         tz = timezone_for_config(config)
