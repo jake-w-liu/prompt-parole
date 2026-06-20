@@ -697,6 +697,47 @@ struct ProtectionStatus {
     codex_path_uses_launcher: bool,
     claude_path_uses_launcher: bool,
     input_guard_running: bool,
+    mac_app_installed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppTab {
+    Status,
+    Schedule,
+    Unlock,
+    Password,
+    Protection,
+}
+
+impl AppTab {
+    const ALL: [Self; 5] = [
+        Self::Status,
+        Self::Schedule,
+        Self::Unlock,
+        Self::Password,
+        Self::Protection,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Status => "Status",
+            Self::Schedule => "Schedule",
+            Self::Unlock => "Unlock",
+            Self::Password => "Password",
+            Self::Protection => "Protection",
+        }
+    }
+
+    fn from_name(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "status" => Some(Self::Status),
+            "schedule" => Some(Self::Schedule),
+            "unlock" => Some(Self::Unlock),
+            "password" => Some(Self::Password),
+            "protection" => Some(Self::Protection),
+            _ => None,
+        }
+    }
 }
 
 struct PromptParoleApp {
@@ -715,6 +756,7 @@ struct PromptParoleApp {
     password_actions: Vec<String>,
     generated_password: String,
     protection: ProtectionStatus,
+    active_tab: AppTab,
 }
 
 impl PromptParoleApp {
@@ -742,6 +784,7 @@ impl PromptParoleApp {
                 .collect(),
             generated_password: String::new(),
             protection: ProtectionStatus::default(),
+            active_tab: initial_app_tab(),
         };
         app.reload();
         app
@@ -1019,39 +1062,56 @@ impl PromptParoleApp {
     }
 
     fn configured_ui(&mut self, ui: &mut egui::Ui) {
-        let wide = ui.available_width() >= 980.0;
-        overview_card(ui, self);
+        tab_bar(ui, &mut self.active_tab);
         ui.add_space(14.0);
-        if wide {
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| {
-                    ui.set_width((ui.available_width() - 18.0) * 0.58);
-                    schedule_settings_card(ui, self, false);
-                    ui.add_space(14.0);
-                    protection_card(ui, self);
-                });
-                ui.add_space(18.0);
-                ui.vertical(|ui| {
-                    ui.set_width(ui.available_width());
-                    unlock_card(ui, self);
-                    ui.add_space(14.0);
-                    password_card(ui, self);
-                    ui.add_space(14.0);
-                    manual_lock_card(ui, self);
-                });
-            });
-        } else {
-            schedule_settings_card(ui, self, false);
-            ui.add_space(14.0);
-            unlock_card(ui, self);
-            ui.add_space(14.0);
-            password_card(ui, self);
-            ui.add_space(14.0);
-            protection_card(ui, self);
-            ui.add_space(14.0);
-            manual_lock_card(ui, self);
+        match self.active_tab {
+            AppTab::Status => overview_card(ui, self),
+            AppTab::Schedule => schedule_settings_card(ui, self, false),
+            AppTab::Unlock => {
+                unlock_card(ui, self);
+                ui.add_space(14.0);
+                manual_lock_card(ui, self);
+            }
+            AppTab::Password => password_card(ui, self),
+            AppTab::Protection => protection_card(ui, self),
         }
     }
+}
+
+fn tab_bar(ui: &mut egui::Ui, active_tab: &mut AppTab) {
+    egui::Frame::new()
+        .fill(panel())
+        .stroke(egui::Stroke::new(1.0, line()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for tab in AppTab::ALL {
+                    let selected = *active_tab == tab;
+                    let fill = if selected {
+                        aomidori()
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+                    let text_color = if selected { button_fg() } else { aomidori() };
+                    let response = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(tab.label())
+                                .size(13.5)
+                                .strong()
+                                .color(text_color),
+                        )
+                        .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, aomidori()))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .min_size(egui::vec2(96.0, 32.0)),
+                    );
+                    if response.clicked() {
+                        *active_tab = tab;
+                    }
+                }
+            });
+        });
 }
 
 fn setup_password_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
@@ -1193,16 +1253,18 @@ fn protection_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
         if full_secondary_button(ui, "Install Hooks & Launchers").clicked() {
             app.install_protection();
         }
+        meta_label(ui, "Protect future Codex and Claude sessions.");
         ui.add_space(8.0);
         if full_secondary_button(ui, "Install Mac App").clicked() {
             app.install_app_bundle();
         }
+        meta_label(ui, "Add Prompt Parole to your Applications folder.");
     });
 }
 
 fn centered_page(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let max_width = 1160.0;
-    let horizontal_margin = 26.0;
+    let max_width = 720.0;
+    let horizontal_margin = 18.0;
     let target_width = (ui.available_width() - horizontal_margin * 2.0)
         .max(320.0)
         .min(max_width);
@@ -1211,9 +1273,9 @@ fn centered_page(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
         ui.add_space(side);
         ui.vertical(|ui| {
             ui.set_width(target_width);
-            ui.add_space(24.0);
+            ui.add_space(18.0);
             add_contents(ui);
-            ui.add_space(28.0);
+            ui.add_space(22.0);
         });
     });
 }
@@ -1413,7 +1475,7 @@ fn app_header(ui: &mut egui::Ui, status: &str, configured: bool) {
     ui.horizontal(|ui| {
         ui.heading(
             egui::RichText::new("Prompt Parole")
-                .size(30.0)
+                .size(26.0)
                 .color(sumi())
                 .strong(),
         );
@@ -1481,62 +1543,104 @@ fn status_summary(ui: &mut egui::Ui, status: &StatusPayload) {
 }
 
 fn protection_summary(ui: &mut egui::Ui, protection: &ProtectionStatus) {
-    subsection_title(ui, "Current Window");
-    protection_row(
+    protection_status_row(
         ui,
-        "Input guard",
-        protection.input_guard_running,
-        "blocks keys in focused Codex/Claude terminal tabs",
+        "Open Codex/Claude windows",
+        protection.input_guard_running.then_some("Protected"),
+        Some("Needs start"),
     );
-    ui.add_space(8.0);
-    subsection_title(ui, "Prompt Gate");
-    protection_row(
+    protection_status_row(
         ui,
-        "Codex hook",
-        protection.codex_hook,
-        "loaded by Codex after restart/trust",
+        "Codex prompt blocking",
+        protection
+            .codex_hook
+            .then_some("Ready after restart")
+            .or(Some("Needs install")),
+        None,
     );
-    protection_row(
+    protection_command_row(
         ui,
-        "Codex launcher",
+        "Codex command launch",
         protection.codex_launcher,
-        "installed in ~/.local/bin",
-    );
-    protection_row(
-        ui,
-        "Codex PATH",
         protection.codex_path_uses_launcher,
-        "codex command uses launcher",
     );
-    ui.add_space(6.0);
-    protection_row(
+    protection_status_row(
         ui,
-        "Claude hook",
-        protection.claude_hook,
-        "loaded by Claude Code after restart",
+        "Claude prompt blocking",
+        protection
+            .claude_hook
+            .then_some("Ready after restart")
+            .or(Some("Needs install")),
+        None,
     );
-    protection_row(
+    protection_command_row(
         ui,
-        "Claude launcher",
+        "Claude command launch",
         protection.claude_launcher,
-        "installed in ~/.local/bin",
-    );
-    protection_row(
-        ui,
-        "Claude PATH",
         protection.claude_path_uses_launcher,
-        "claude command uses launcher",
+    );
+    protection_status_row(
+        ui,
+        "Mac app menu",
+        protection.mac_app_installed.then_some("Installed"),
+        Some("Needs install"),
     );
 }
 
-fn protection_row(ui: &mut egui::Ui, label: &str, ok: bool, detail: &str) {
-    ui.horizontal_wrapped(|ui| {
-        let marker = if ok { "READY" } else { "MISSING" };
-        let color = if ok { aomidori() } else { enji() };
-        ui.label(egui::RichText::new(marker).strong().color(color).size(12.0));
+fn protection_command_row(ui: &mut egui::Ui, label: &str, launcher: bool, path_ready: bool) {
+    let status = protection_command_status(launcher, path_ready);
+    protection_status_row(ui, label, Some(status), None);
+}
+
+fn protection_command_status(launcher: bool, path_ready: bool) -> &'static str {
+    if path_ready {
+        "Protected"
+    } else if launcher {
+        "Not first in PATH"
+    } else {
+        "Needs install"
+    }
+}
+
+fn protection_status_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    positive_status: Option<&str>,
+    fallback_status: Option<&str>,
+) {
+    let status = positive_status.unwrap_or_else(|| fallback_status.unwrap_or("Off"));
+    let color = match status {
+        "Protected" | "Installed" | "Ready after restart" => aomidori(),
+        "Not first in PATH" => yamabuki(),
+        _ => enji(),
+    };
+    ui.horizontal(|ui| {
+        ui.set_height(24.0);
         ui.label(egui::RichText::new(label).strong().color(sumi()).size(13.0));
-        meta_label(ui, detail);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            status_badge(ui, status, color);
+        });
     });
+}
+
+fn status_badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    let text_color = if color == yamabuki() {
+        sumi()
+    } else {
+        button_fg()
+    };
+    egui::Frame::new()
+        .fill(color)
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::symmetric(9, 4))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .size(11.5)
+                    .strong()
+                    .color(text_color),
+            );
+        });
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str) {
@@ -1647,6 +1751,13 @@ fn generate_password() -> String {
         out.push(ALPHABET[pos] as char);
     }
     out
+}
+
+fn initial_app_tab() -> AppTab {
+    env::var("PROMPT_PAROLE_INITIAL_TAB")
+        .ok()
+        .and_then(|value| AppTab::from_name(&value))
+        .unwrap_or(AppTab::Status)
 }
 
 fn normalized_actions(actions: &[String]) -> Vec<String> {
@@ -3062,6 +3173,7 @@ fn protection_status() -> ProtectionStatus {
         codex_path_uses_launcher: command_uses_launcher("codex"),
         claude_path_uses_launcher: command_uses_launcher("claude"),
         input_guard_running: input_guard_running(),
+        mac_app_installed: macos_app_bundle_installed(),
     }
 }
 
@@ -3377,6 +3489,27 @@ fn macos_app_info_plist() -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
+fn macos_app_bundle_installed() -> bool {
+    dirs::home_dir()
+        .map(|home| home.join("Applications").join("Prompt Parole.app"))
+        .is_some_and(|app| {
+            let info = app.join("Contents").join("Info.plist");
+            let exe = app.join("Contents").join("MacOS").join("prompt-parole");
+            info.is_file()
+                && exe.is_file()
+                && fs::read_to_string(info).is_ok_and(|value| {
+                    value.contains("<string>Prompt Parole</string>")
+                        && value.contains("<string>APPL</string>")
+                })
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_app_bundle_installed() -> bool {
+    false
+}
+
 fn launch_agent(
     core: &ParoleCore,
     agent: &str,
@@ -3595,8 +3728,8 @@ fn run_gui() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Prompt Parole")
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([920.0, 620.0]),
+            .with_inner_size([760.0, 460.0])
+            .with_min_inner_size([620.0, 400.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -3883,6 +4016,20 @@ mod tests {
         assert!(plist.contains("<string>prompt-parole</string>"));
         assert!(plist.contains("<key>CFBundlePackageType</key>"));
         assert!(plist.contains("<string>APPL</string>"));
+    }
+
+    #[test]
+    fn protection_command_statuses_are_human_readable() {
+        assert_eq!(protection_command_status(true, true), "Protected");
+        assert_eq!(protection_command_status(true, false), "Not first in PATH");
+        assert_eq!(protection_command_status(false, false), "Needs install");
+    }
+
+    #[test]
+    fn app_tab_names_parse_for_debug_screenshots() {
+        assert_eq!(AppTab::from_name("status"), Some(AppTab::Status));
+        assert_eq!(AppTab::from_name("Protection"), Some(AppTab::Protection));
+        assert_eq!(AppTab::from_name("unknown"), None);
     }
 
     #[test]

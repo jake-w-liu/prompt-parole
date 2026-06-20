@@ -113,12 +113,12 @@ Japanese palette inspired by Nippon Colors and Sanzo Wada-style
 color-combination references, because a relationship-saving tool should not look
 like a router admin page.
 
-The configured desktop view has two columns: schedule and settings on the left,
-current lock state and protection status on the right. Use **Start Input Guard**
-to block typing into the already-open Codex/Claude Terminal tab during curfew.
-Use **Install Hooks & Launchers** after entering the current password to install
-both prompt hooks and local `codex`/`claude` launch wrappers for future
-sessions.
+The configured desktop view is tabbed so the window can stay small:
+**Status**, **Schedule**, **Unlock**, **Password**, and **Protection**. Use
+**Start Input Guard** on the Status tab to block typing into the already-open
+Codex/Claude Terminal tab during curfew. Use **Install Hooks & Launchers** on
+the Protection tab after entering the current password to protect future
+sessions and local `codex`/`claude` commands.
 
 ## Config
 
