@@ -12,8 +12,12 @@ cannot keep feeding the prompt machine after curfew without parole.
 ## What It Does
 
 - Blocks Claude Code and Codex prompts during configured hours.
-- Adds a macOS Input Guard for already-open terminal sessions (Terminal, iTerm2,
-  Ghostty, kitty, WezTerm, Alacritty, Hyper, Tabby): it blocks prompt
+- Runs protected Terminal launches through a PTY proxy: if curfew begins while
+  Codex/Claude is already running, output keeps rendering but stdin is not
+  forwarded to the agent until prompts are unlocked.
+- Adds a macOS Input Guard for terminal sessions that predate the launcher
+  proxy (Terminal, iTerm2, Ghostty, kitty, WezTerm, Alacritty, Hyper, Tabby):
+  it blocks prompt
   entry/submission keys in focused Codex/Claude windows while leaving output and
   navigation visible. The focused window is matched by title and, as a fallback,
   by inspecting the terminal's process tree for a running agent. (Editors/IDEs
@@ -177,12 +181,13 @@ The hook is evaluated on every prompt by sessions that loaded and trusted it.
 That means a session started at 6:30 PM should block its next prompt after a
 7:00 PM curfew while still showing the output that already exists.
 
-Already-running sessions that predate hook installation cannot be retroactively
-forced to load a hook by editing a config file. The Input Guard below is the
-current-window layer for those sessions: it blocks prompt-entry keys in the
-focused Codex/Claude Terminal tab while output remains visible. Reopen Claude
-Code or Codex through the protected launcher after installation to add hook and
-launcher protection to future sessions too.
+Already-running sessions that predate hook/launcher installation cannot be
+retroactively forced to load protection by editing a config file. Reopen Claude
+Code or Codex through the protected launcher after installation to add the hook,
+launch gate, and live PTY input filter to future terminal sessions. The Input
+Guard below is the fallback current-window layer for older sessions: it blocks
+prompt-entry keys in the focused Codex/Claude Terminal tab while output remains
+visible.
 
 Codex also requires non-managed command hooks to be trusted before they run.
 Prompt Parole's Codex launcher wrapper starts Codex with hook trust bypass for
@@ -191,16 +196,22 @@ decision.
 
 ## Current-Window Input Guard
 
-`prompt-parole guard` is the layer for the exact "I can watch output but cannot
-send another prompt" workflow. On macOS it installs a keyboard event tap and
-checks the focused window on each keystroke. When curfew is active and the
-focused window is running `codex`, `claude`, or `claude-code` (matched by window
-title, or by walking the focused app's process tree), prompt-entry keys are
-swallowed before the terminal receives them. The terminal process is not paused,
-so output can continue to render. Navigation keys and system shortcuts are left
-alone so the session does not feel frozen. If macOS disables the event tap (it
-does this on heavy input or a slow callback), the guard re-enables it
-immediately so the curfew is not silently dropped.
+Updated `codex`/`claude` launchers run interactive terminal sessions through a
+Prompt Parole PTY proxy. The proxy gives the real agent a normal TTY, keeps the
+agent's output flowing, and stops forwarding stdin while curfew is active. That
+is the primary layer for the exact "I can watch output but cannot send another
+prompt" workflow in newly launched Terminal sessions.
+
+`prompt-parole guard` covers sessions that were already open before the updated
+launcher was installed or before the session was restarted. On macOS it installs
+a keyboard event tap and checks the focused window on each keystroke. When
+curfew is active and the focused window is running `codex`, `claude`, or
+`claude-code` (matched by window title, or by walking the focused app's process
+tree), prompt-entry keys are swallowed before the terminal receives them. The
+terminal process is not paused, so output can continue to render. Navigation
+keys and system shortcuts are left alone so the session does not feel frozen. If
+macOS disables the event tap (it does this on heavy input or a slow callback),
+the guard re-enables it immediately so the curfew is not silently dropped.
 
 You may need to grant macOS Accessibility/Input Monitoring permission to the
 `prompt-parole` binary the first time the guard starts. If macOS refuses the
@@ -223,16 +234,18 @@ running Codex/Claude process.
 
 ## Protection Layers
 
-Prompt Parole has four local layers:
+Prompt Parole has five local layers:
 
-1. **Input Guard** blocks prompt-entry keys in the currently focused macOS
-   Codex/Claude terminal window during curfew, while output stays visible.
-2. **Hooks** block prompt submissions in Claude Code and Codex sessions that have
+1. **Terminal PTY proxy** keeps output visible but blocks stdin for
+   wrapper-launched Codex/Claude terminal sessions while curfew is active.
+2. **Input Guard** blocks prompt-entry keys in the currently focused macOS
+   Codex/Claude terminal window for older non-proxied sessions during curfew.
+3. **Hooks** block prompt submissions in Claude Code and Codex sessions that have
    loaded and trusted the hook.
-3. **Launch wrappers** block new `codex` and `claude` process launches during
+4. **Launch wrappers** block new `codex` and `claude` process launches during
    curfew. The wrappers live in `~/.local/bin`, which should appear before
    Homebrew or system binary directories in `PATH`.
-4. **VS Code extensions** (Claude Code and Codex) are gated by pointing each
+5. **VS Code extensions** (Claude Code and Codex) are gated by pointing each
    extension's agent-launch setting at a Prompt Parole shim. Run
    `prompt-parole install-vscode` (or the **Cover VS Code Extensions** button on
    the Protection tab), then reload VS Code.
@@ -254,11 +267,11 @@ agent-launch settings to point at it:
 - Codex's (`openai.chatgpt`) `chatgpt.cliExecutable`
 
 During curfew the shim runs `prompt-parole check` and refuses to start the agent;
-outside curfew it execs the real agent unchanged. Already-open VS Code extension
-chats are not paused: VS Code does not expose a prompt-submit hook for these
-extensions, and Prompt Parole does not stop running agents because that would
-also stop or hide the progress you are allowed to inspect. Reload/restart VS Code
-after installing coverage so new extension sessions use the shim.
+outside curfew it starts the real agent behind a small Prompt Parole stream
+proxy. If curfew begins while a VS Code extension session is already open, the
+proxy keeps stdout/stderr flowing so progress remains visible, but it stops
+forwarding stdin to the child agent until prompts are unlocked. Reload/restart
+VS Code after installing coverage so extension sessions use the shim.
 
 (Other AI extensions such as GitHub Copilot Chat cannot be gated this way; VS Code
 does not let one extension intercept another's prompts.)

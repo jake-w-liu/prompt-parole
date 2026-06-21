@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
@@ -714,7 +714,9 @@ fn write_json_shared<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
 #[cfg(unix)]
 fn existing_file_mode(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
-    fs::metadata(path).ok().map(|meta| meta.permissions().mode())
+    fs::metadata(path)
+        .ok()
+        .map(|meta| meta.permissions().mode())
 }
 
 #[cfg(not(unix))]
@@ -1631,7 +1633,8 @@ fn password_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
         ui.add_space(8.0);
         let next = vertical_password_editor(ui, "New password", &mut app.passwords.new_first);
         ui.add_space(8.0);
-        let again = vertical_password_editor(ui, "New password again", &mut app.passwords.new_again);
+        let again =
+            vertical_password_editor(ui, "New password again", &mut app.passwords.new_again);
         ui.add_space(12.0);
         password_suggestion(ui, app);
         ui.add_space(10.0);
@@ -1759,12 +1762,7 @@ fn labeled_duration(ui: &mut egui::Ui, label: &str, value: &mut i64) {
 }
 
 fn field_label(ui: &mut egui::Ui, label: &str) {
-    ui.label(
-        egui::RichText::new(label)
-            .size(13.0)
-            .strong()
-            .color(nibi()),
-    );
+    ui.label(egui::RichText::new(label).size(13.0).strong().color(nibi()));
 }
 
 fn full_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -1945,7 +1943,10 @@ fn app_header(ui: &mut egui::Ui, status: Option<&StatusPayload>, configured: boo
 }
 
 /// (text, background, foreground) for the live status pill.
-fn pill_style(status: Option<&StatusPayload>, configured: bool) -> (&'static str, egui::Color32, egui::Color32) {
+fn pill_style(
+    status: Option<&StatusPayload>,
+    configured: bool,
+) -> (&'static str, egui::Color32, egui::Color32) {
     if !configured {
         return ("Not configured", yamabuki(), sumi());
     }
@@ -1955,7 +1956,6 @@ fn pill_style(status: Option<&StatusPayload>, configured: bool) -> (&'static str
         None => ("Status unavailable", nibi(), button_fg()),
     }
 }
-
 
 fn status_pill(ui: &mut egui::Ui, status: Option<&StatusPayload>, configured: bool) {
     let (text, fill, text_color) = pill_style(status, configured);
@@ -2122,11 +2122,7 @@ fn subsection_title(ui: &mut egui::Ui, title: &str) {
 }
 
 fn meta_label(ui: &mut egui::Ui, text: impl Into<String>) {
-    ui.label(
-        egui::RichText::new(text.into())
-            .color(nibi())
-            .size(13.0),
-    );
+    ui.label(egui::RichText::new(text.into()).color(nibi()).size(13.0));
 }
 
 fn section_frame() -> egui::Frame {
@@ -2522,6 +2518,15 @@ enum CommandKind {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    #[command(hide = true)]
+    Proxy {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        real: PathBuf,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
     Uninstall {
         #[arg(long)]
         password_stdin: bool,
@@ -2561,7 +2566,13 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             if first != second {
                 return Err("Passwords do not match.".to_owned());
             }
-            core.setup(&first, lock_window, timezone, unlock_duration_minutes, actions)?;
+            core.setup(
+                &first,
+                lock_window,
+                timezone,
+                unlock_duration_minutes,
+                actions,
+            )?;
             println!("Prompt Parole is set up.");
             Ok(0)
         }
@@ -2596,8 +2607,13 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
                 actions.clone(),
             )?;
             let current = read_current_password(password_stdin, "Current password: ")?;
-            let config =
-                core.configure(&current, windows, timezone, unlock_duration_minutes, actions)?;
+            let config = core.configure(
+                &current,
+                windows,
+                timezone,
+                unlock_duration_minutes,
+                actions,
+            )?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&config).map_err(|err| err.to_string())?
@@ -2817,6 +2833,7 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             Ok(0)
         }
         CommandKind::Launch { agent, real, args } => launch_agent(core, &agent, &real, &args),
+        CommandKind::Proxy { agent, real, args } => proxy_agent(core, &agent, &real, &args),
         CommandKind::Uninstall {
             password_stdin,
             targets,
@@ -2942,7 +2959,9 @@ fn parse_targets(raw: &str) -> Result<Vec<String>, String> {
             continue;
         }
         if clean != "claude" && clean != "codex" {
-            return Err(format!("Unknown target {clean:?}; expected claude or codex."));
+            return Err(format!(
+                "Unknown target {clean:?}; expected claude or codex."
+            ));
         }
         // Dedup so repeated targets do not double-process the same config (and so
         // a second pass cannot trip over the first pass's own changes).
@@ -3249,10 +3268,12 @@ fn start_guard_once(core: &ParoleCore) -> Result<(), String> {
         // Tear the agent back down so launchd does not respawn a permission-less
         // guard every ~10s (KeepAlive) until the user grants permission.
         let _ = run_launchctl(&["bootout", &target]);
-        Err("Input guard did not stay running. Grant Prompt Parole permission under \
+        Err(
+            "Input guard did not stay running. Grant Prompt Parole permission under \
              System Settings > Privacy & Security > Input Monitoring (and Accessibility), \
              then start it again."
-            .to_owned())
+                .to_owned(),
+        )
     }
 }
 
@@ -3459,7 +3480,11 @@ fn split_pid_line(line: &str) -> Option<(u32, &str)> {
 /// argument is `command_arg`. Tolerant of spaces in the executable path.
 fn process_matches(exe_path: &str, args: &str, command_arg: &str) -> bool {
     let exe_path = exe_path.trim();
-    if Path::new(exe_path).file_name().and_then(|name| name.to_str()) != Some("prompt-parole") {
+    if Path::new(exe_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some("prompt-parole")
+    {
         return false;
     }
     // `args` starts with the executable path; the subcommand is the token after it.
@@ -4421,9 +4446,8 @@ fn install_macos_app_bundle(app_dir: Option<&Path>) -> Result<PathBuf, String> {
             fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
                 .map_err(|err| format!("Could not make {} executable: {err}", staging.display()))?;
         }
-        fs::rename(&staging, &bundled_exe).map_err(|err| {
-            format!("Could not install {}: {err}", bundled_exe.display())
-        })?;
+        fs::rename(&staging, &bundled_exe)
+            .map_err(|err| format!("Could not install {}: {err}", bundled_exe.display()))?;
         // Re-establish a valid ad-hoc signature for the freshly written bytes, so
         // the binary is not killed for a signature mismatch.
         adhoc_codesign(&bundled_exe)?;
@@ -4616,18 +4640,350 @@ fn launch_agent(
         })?;
         resolved.as_path()
     };
-    let mut command = Command::new(real);
+    let launch_args = launch_args_for_agent(agent, args);
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        run_agent_pty_proxy(core, agent, real, &launch_args)
+    } else {
+        run_agent_direct(real, &launch_args)
+    }
+}
+
+fn launch_args_for_agent(agent: &str, args: &[String]) -> Vec<String> {
+    let mut launch_args = Vec::new();
     if agent == "codex"
         && !args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-hook-trust")
     {
-        command.arg("--dangerously-bypass-hook-trust");
+        launch_args.push("--dangerously-bypass-hook-trust".to_owned());
     }
-    let status = command
+    launch_args.extend(args.iter().cloned());
+    launch_args
+}
+
+fn run_agent_direct(real: &Path, args: &[String]) -> Result<i32, String> {
+    let status = Command::new(real)
         .args(args)
         .status()
         .map_err(|err| format!("Could not launch {}: {err}", real.display()))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(unix)]
+fn run_agent_pty_proxy(
+    core: &ParoleCore,
+    agent: &str,
+    real: &Path,
+    args: &[String],
+) -> Result<i32, String> {
+    use portable_pty::{CommandBuilder, native_pty_system};
+
+    let _raw_mode = RawTerminalMode::enter_stdin().map_err(|err| {
+        format!(
+            "Could not prepare protected terminal input for {agent}: {err}. \
+             Prompt Parole will not start an unprotected interactive session."
+        )
+    })?;
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(current_pty_size())
+        .map_err(|err| format!("Could not create protected terminal for {agent}: {err}"))?;
+    let mut cmd = CommandBuilder::new(real.as_os_str());
+    cmd.args(args.iter().map(String::as_str));
+    let mut child = pair.slave.spawn_command(cmd).map_err(|err| {
+        format!(
+            "Could not launch {} in protected terminal: {err}",
+            real.display()
+        )
+    })?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|err| format!("Could not read protected terminal output: {err}"))?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|err| format!("Could not write protected terminal input: {err}"))?;
+
+    let output_thread = thread::spawn(move || {
+        let mut stdout = std::io::stdout().lock();
+        let _ = std::io::copy(&mut reader, &mut stdout);
+        let _ = stdout.flush();
+    });
+
+    let done = Arc::new(AtomicBool::new(false));
+    let resize_done = Arc::clone(&done);
+    let master = pair.master;
+    let resize_thread = thread::spawn(move || {
+        let mut last_size = current_pty_size();
+        let _ = master.resize(last_size);
+        while !resize_done.load(Ordering::Relaxed) {
+            thread::sleep(StdDuration::from_millis(250));
+            let next_size = current_pty_size();
+            if next_size != last_size {
+                let _ = master.resize(next_size);
+                last_size = next_size;
+            }
+        }
+    });
+
+    let input_core = core.clone();
+    let input_done = Arc::clone(&done);
+    let input_thread = thread::spawn(move || {
+        let mut stderr = std::io::stderr().lock();
+        let mut buf = [0_u8; 4096];
+        let mut warned_locked = false;
+        loop {
+            if input_done.load(Ordering::Relaxed) {
+                break;
+            }
+            let read = match poll_stdin_chunk(&mut buf, 100) {
+                Ok(Some(read)) => read,
+                Ok(None) => continue,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+            if guard_curfew_active(&input_core) {
+                if !warned_locked {
+                    let _ = stderr.write_all(
+                        b"\r\nPrompt Parole: curfew is active; terminal agent input is blocked while output remains visible.\r\n",
+                    );
+                    let _ = stderr.flush();
+                    warned_locked = true;
+                }
+                continue;
+            }
+            warned_locked = false;
+            if writer.write_all(&buf[..read]).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("Could not wait for {}: {err}", real.display()))?;
+    done.store(true, Ordering::Relaxed);
+    let _ = input_thread.join();
+    let _ = resize_thread.join();
+    let _ = output_thread.join();
+    let code = status.exit_code();
+    Ok(if code > i32::MAX as u32 {
+        1
+    } else {
+        code as i32
+    })
+}
+
+#[cfg(unix)]
+fn poll_stdin_chunk(buf: &mut [u8], timeout_millis: i32) -> Result<Option<usize>, std::io::Error> {
+    let mut poll_fd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `poll_fd` points to one valid pollfd and the timeout is bounded.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_millis) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        if poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Ok(Some(0));
+        }
+        if poll_fd.revents & libc::POLLIN == 0 {
+            return Ok(None);
+        }
+        // SAFETY: `buf` is valid writable storage for `buf.len()` bytes.
+        let read = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
+        };
+        if read < 0 {
+            let err = std::io::Error::last_os_error();
+            if matches!(err.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        return Ok(Some(read as usize));
+    }
+}
+
+#[cfg(not(unix))]
+fn run_agent_pty_proxy(
+    _core: &ParoleCore,
+    _agent: &str,
+    real: &Path,
+    args: &[String],
+) -> Result<i32, String> {
+    run_agent_direct(real, args)
+}
+
+#[cfg(unix)]
+fn current_pty_size() -> portable_pty::PtySize {
+    let (cols, rows) = terminal_size::terminal_size()
+        .map(|(terminal_size::Width(cols), terminal_size::Height(rows))| (cols, rows))
+        .unwrap_or((80, 24));
+    portable_pty::PtySize {
+        rows: rows.max(1),
+        cols: cols.max(1),
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+#[cfg(unix)]
+struct RawTerminalMode {
+    fd: libc::c_int,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawTerminalMode {
+    fn enter_stdin() -> Result<Self, std::io::Error> {
+        let fd = libc::STDIN_FILENO;
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `fd` is stdin and `original` points to writable termios storage.
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `tcgetattr` succeeded, so `original` is initialized.
+        let original = unsafe { original.assume_init() };
+        let mut raw = original;
+        // SAFETY: `raw` is an initialized termios value.
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+        }
+        // SAFETY: `fd` is stdin and `raw` points to a valid termios value.
+        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawTerminalMode {
+    fn drop(&mut self) {
+        // SAFETY: `self.original` was captured from this fd by `tcgetattr`.
+        let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original) };
+    }
+}
+
+fn proxy_agent(
+    core: &ParoleCore,
+    agent: &str,
+    real: &Path,
+    args: &[String],
+) -> Result<i32, String> {
+    if agent != "codex" && agent != "claude" {
+        return Err(format!("Unsupported proxy agent {agent:?}."));
+    }
+    if core.is_configured() {
+        let decision = core.decision()?;
+        if !decision.allowed {
+            let until = decision
+                .locked_until
+                .map(|value| value.format("%Y-%m-%d %H:%M %Z").to_string())
+                .unwrap_or_else(|| "the scheduled unlock time".to_owned());
+            eprintln!("Prompt Parole: curfew is active until {until}.");
+            return Ok(1);
+        }
+    }
+
+    let resolved;
+    let real = if real.is_file() {
+        real
+    } else {
+        resolved = resolve_agent_at_runtime(agent).ok_or_else(|| {
+            format!(
+                "Could not find the {agent} binary (it may have been upgraded or removed). \
+                 Reinstall the Prompt Parole VS Code wrapper to repair it."
+            )
+        })?;
+        resolved.as_path()
+    };
+
+    let mut child = Command::new(real)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("Could not launch {}: {err}", real.display()))?;
+
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("Could not open stdin for {}.", real.display()))?;
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("Could not open stdout for {}.", real.display()))?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("Could not open stderr for {}.", real.display()))?;
+
+    let stdout_thread = thread::spawn(move || {
+        let mut stdout = std::io::stdout().lock();
+        let _ = std::io::copy(&mut child_stdout, &mut stdout);
+        let _ = stdout.flush();
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut stderr = std::io::stderr().lock();
+        let _ = std::io::copy(&mut child_stderr, &mut stderr);
+        let _ = stderr.flush();
+    });
+
+    let input_core = core.clone();
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0_u8; 8192];
+        let mut warned_locked = false;
+        while let Ok(read) = stdin.read(&mut buf) {
+            if read == 0 {
+                break;
+            }
+            if guard_curfew_active(&input_core) {
+                if !warned_locked {
+                    eprintln!(
+                        "Prompt Parole: curfew is active; VS Code agent input is blocked while output remains visible."
+                    );
+                    warned_locked = true;
+                }
+                continue;
+            }
+            warned_locked = false;
+            if child_stdin.write_all(&buf[..read]).is_err() {
+                break;
+            }
+            let _ = child_stdin.flush();
+        }
+    });
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("Could not wait for {}: {err}", real.display()))?;
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
     Ok(status.code().unwrap_or(1))
 }
 
@@ -4676,11 +5032,10 @@ fn ensure_hook_marker(command: &str) -> String {
 // The Claude Code / Codex VS Code extensions do not fire the settings.json /
 // hooks.json prompt-submit hook (an upstream bug), so the hook layer can't gate
 // them. Instead we point each extension's "launch the agent process" setting at a
-// thin Prompt Parole shim. The shim refuses to start the agent during curfew,
-// which blocks new extension sessions. Already-open extension chats are left
-// running: the extensions do not expose a prompt hook, and Prompt Parole
-// deliberately does not pause running agents because that would hide or stall
-// progress the user is allowed to inspect.
+// thin Prompt Parole proxy. The proxy refuses to start a new agent during curfew.
+// For sessions that were already open when curfew begins, it keeps stdout/stderr
+// flowing but stops forwarding stdin to the child agent, so progress stays visible
+// and new prompts do not reach the agent.
 // ---------------------------------------------------------------------------
 
 const VSCODE_CLAUDE_SETTING: &str = "claudeCode.claudeProcessWrapper";
@@ -4700,10 +5055,10 @@ fn vscode_user_settings_path() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Body that resolves the real agent and execs it. `$@` from Claude Code already
-/// starts with the bundled binary; Codex's cliExecutable IS the binary, so we
-/// resolve the latest bundled codex and exec it with the args. This wrapper only
-/// blocks *new* launches during curfew; already-open chats keep running.
+/// Body that resolves the real agent and runs it through Prompt Parole's stream
+/// proxy. `$@` from Claude Code already starts with the bundled binary; Codex's
+/// cliExecutable IS the binary, so we resolve the latest bundled codex and proxy
+/// it with the args.
 fn vscode_wrapper_script(prompt_parole_exe: &Path, exec_body: &str) -> String {
     // `check` exits 1 only when configured AND currently blocked; 0 (allowed) and 2
     // (unconfigured/error) both fall through to running the agent, matching Prompt
@@ -4733,12 +5088,18 @@ fn install_vscode_wrappers(core: &ParoleCore) -> Result<String, String> {
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("prompt-parole"));
     let claude_wrapper = dir.join("vscode-claude-wrapper.sh");
     let codex_wrapper = dir.join("vscode-codex-wrapper.sh");
-    // Claude Code invokes: <wrapper> <bundled-binary> <args...> — exec passes through.
-    write_vscode_wrapper(&claude_wrapper, &vscode_wrapper_script(&exe, "exec \"$@\""))?;
+    let quoted_exe = shell_quote(&exe.to_string_lossy());
+    // Claude Code invokes: <wrapper> <bundled-binary> <args...>.
+    let claude_body = format!(
+        "real=$1\nif [ -z \"$real\" ]; then\n  echo 'Prompt Parole: missing Claude binary.' >&2\n  exit 1\nfi\nshift\nexec {quoted_exe} proxy --agent claude --real \"$real\" -- \"$@\""
+    );
+    write_vscode_wrapper(&claude_wrapper, &vscode_wrapper_script(&exe, &claude_body))?;
     // Codex (openai.chatgpt) treats cliExecutable AS codex, so resolve the bundled
-    // codex (latest version) and exec it with the args.
-    let codex_body = "real=$(ls -t \"$HOME\"/.vscode/extensions/openai.chatgpt-*/bin/*/codex 2>/dev/null | head -1)\n[ -n \"$real\" ] || real=codex\nexec \"$real\" \"$@\"";
-    write_vscode_wrapper(&codex_wrapper, &vscode_wrapper_script(&exe, codex_body))?;
+    // codex (latest version) and proxy it with the args.
+    let codex_body = format!(
+        "real=$(ls -t \"$HOME\"/.vscode/extensions/openai.chatgpt-*/bin/*/codex 2>/dev/null | head -1)\n[ -n \"$real\" ] || real=codex\nexec {quoted_exe} proxy --agent codex --real \"$real\" -- \"$@\""
+    );
+    write_vscode_wrapper(&codex_wrapper, &vscode_wrapper_script(&exe, &codex_body))?;
 
     let settings = vscode_user_settings_path()?;
     let mut data = load_vscode_settings(&settings)?;
@@ -5107,14 +5468,21 @@ fn render_icon(size: u32) -> Vec<u8> {
             let y = py as f32 + 0.5;
 
             let tile_cov = coverage(sdf_round_rect(
-                x, y, tile_c, tile_c, tile_half, tile_half, tile_radius,
+                x,
+                y,
+                tile_c,
+                tile_c,
+                tile_half,
+                tile_half,
+                tile_radius,
             ));
             if tile_cov <= 0.0 {
                 continue; // transparent outside the tile
             }
 
             let body_d = sdf_round_rect(x, y, cx, body_cy, body_hx, body_hy, body_radius);
-            let shackle_d = sdf_shackle(x, y, cx, shackle_cy, shackle_r, leg_bottom) - shackle_half_t;
+            let shackle_d =
+                sdf_shackle(x, y, cx, shackle_cy, shackle_r, leg_bottom) - shackle_half_t;
             let mut lock_cov = coverage(body_d.min(shackle_d));
 
             let key_d = (distance(x, y, cx, key_cy) - key_r).min(sdf_round_rect(
@@ -5562,12 +5930,41 @@ mod tests {
 
     #[test]
     fn vscode_wrapper_gates_on_curfew_and_is_marked() {
-        let script = vscode_wrapper_script(Path::new("/tmp/prompt-parole"), "exec \"$@\"");
-        // Recognizable as ours, gates via `check`, passes through outside curfew.
+        let script = vscode_wrapper_script(
+            Path::new("/tmp/prompt-parole"),
+            "exec /tmp/prompt-parole proxy --agent codex --real codex -- \"$@\"",
+        );
+        // Recognizable as ours, gates via `check`, then proxies outside curfew.
         assert!(script.contains("PROMPT_PAROLE_LAUNCHER=1"));
         assert!(script.contains("/tmp/prompt-parole check"));
         assert!(script.contains("exit 1"));
-        assert!(script.contains("exec \"$@\""));
+        assert!(script.contains("proxy --agent codex"));
+    }
+
+    #[test]
+    fn proxy_blocks_new_vscode_agent_launch_when_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = ParoleCore {
+            app_dir: dir.path().to_path_buf(),
+        };
+        core.setup(
+            "ok",
+            vec![
+                "00:00-23:59 mon,tue,wed,thu,fri,sat,sun".to_owned(),
+                "23:59-00:00 mon,tue,wed,thu,fri,sat,sun".to_owned(),
+            ],
+            "local".to_owned(),
+            30,
+            PASSWORD_ACTIONS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        )
+        .unwrap();
+
+        let code = proxy_agent(&core, "codex", Path::new("/bin/cat"), &[]).unwrap();
+
+        assert_eq!(code, 1);
     }
 
     #[test]
@@ -5581,16 +5978,37 @@ mod tests {
         //   └─ 30 prompt-parole ─ 31 claude              (this harness: must NOT match)
         let mut procs: HashMap<u32, (u32, String)> = HashMap::new();
         procs.insert(1, (0, "/sbin/launchd".into()));
-        procs.insert(10, (1, "/System/.../Terminal.app/Contents/MacOS/Terminal".into()));
+        procs.insert(
+            10,
+            (1, "/System/.../Terminal.app/Contents/MacOS/Terminal".into()),
+        );
         procs.insert(11, (10, "-zsh".into()));
         procs.insert(12, (11, "codex".into()));
-        procs.insert(20, (1, "/Applications/Visual Studio Code.app/Contents/MacOS/Electron".into()));
+        procs.insert(
+            20,
+            (
+                1,
+                "/Applications/Visual Studio Code.app/Contents/MacOS/Electron".into(),
+            ),
+        );
         procs.insert(21, (20, "Code Helper (Plugin)".into()));
-        procs.insert(22, (21, "/Users/x/.vscode/extensions/openai.chatgpt-1/bin/codex".into()));
+        procs.insert(
+            22,
+            (
+                21,
+                "/Users/x/.vscode/extensions/openai.chatgpt-1/bin/codex".into(),
+            ),
+        );
         procs.insert(23, (20, "Code Helper (Plugin)".into()));
         procs.insert(24, (23, "-zsh".into()));
         procs.insert(25, (24, "claude".into()));
-        procs.insert(30, (1, "/Users/x/Applications/Prompt Parole.app/Contents/MacOS/prompt-parole".into()));
+        procs.insert(
+            30,
+            (
+                1,
+                "/Users/x/Applications/Prompt Parole.app/Contents/MacOS/prompt-parole".into(),
+            ),
+        );
         procs.insert(31, (30, "claude".into()));
         assert_eq!(vscode_descendant_agents(&procs), vec![22, 25]);
     }
@@ -5742,7 +6160,10 @@ mod tests {
             .map(|i| rgba[(i * 4) as usize] as u32)
             .max()
             .unwrap();
-        assert!(lightest > 200, "expected a light lock pixel, got {lightest}");
+        assert!(
+            lightest > 200,
+            "expected a light lock pixel, got {lightest}"
+        );
     }
 
     #[test]
@@ -5784,7 +6205,11 @@ mod tests {
     fn process_tree_detects_agent_descendant() {
         // 100 (iTerm2) -> 200 (zsh) -> 300 (claude)
         let rows = vec![
-            (100, 1, "/Applications/iTerm.app/Contents/MacOS/iTerm2".to_owned()),
+            (
+                100,
+                1,
+                "/Applications/iTerm.app/Contents/MacOS/iTerm2".to_owned(),
+            ),
             (200, 100, "/bin/zsh".to_owned()),
             (300, 200, "/opt/homebrew/bin/claude".to_owned()),
             (400, 1, "/usr/bin/vim".to_owned()),
@@ -5806,7 +6231,9 @@ mod tests {
         );
         // A comm path containing spaces must be preserved intact.
         assert_eq!(
-            parse_proc_row("  500   1   /Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+            parse_proc_row(
+                "  500   1   /Applications/Visual Studio Code.app/Contents/MacOS/Electron"
+            ),
             Some((
                 500,
                 1,
@@ -5862,7 +6289,11 @@ mod tests {
             &format!("{bundle} guard-watchdog --interval-seconds 2"),
             "guard-watchdog"
         ));
-        assert!(!process_matches(bundle, &format!("{bundle} guard"), "guard-watchdog"));
+        assert!(!process_matches(
+            bundle,
+            &format!("{bundle} guard"),
+            "guard-watchdog"
+        ));
     }
 
     #[test]
