@@ -3331,12 +3331,21 @@ fn guard_watchdog_running() -> bool {
 
 const WATCHDOG_MAX_ATTEMPTS: u32 = 3;
 const WATCHDOG_BACKOFF: StdDuration = StdDuration::from_secs(300);
+const WATCHDOG_BACKOFF_POLL: StdDuration = StdDuration::from_secs(60);
+
+fn watchdog_backoff_sleep(now: Instant, until: Instant) -> StdDuration {
+    until
+        .checked_duration_since(now)
+        .unwrap_or_default()
+        .min(WATCHDOG_BACKOFF_POLL)
+}
 
 fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, String> {
     if interval_seconds == 0 {
         return Err("interval-seconds must be positive.".to_owned());
     }
     println!("Prompt Parole guard watchdog is running.");
+    let interval = StdDuration::from_secs(interval_seconds);
     let mut failures: u32 = 0;
     let mut backoff_until: Option<Instant> = None;
     loop {
@@ -3346,35 +3355,44 @@ fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, St
         let keyboard_guard_enabled = guard_agent_plist_path()
             .map(|path| path.exists())
             .unwrap_or(false);
-        let keyboard_running = input_guard_running();
         if !locked || !keyboard_guard_enabled {
             // Nothing to recover; reset the backoff state.
             failures = 0;
             backoff_until = None;
-        } else if !keyboard_running {
-            let backing_off = backoff_until.is_some_and(|until| Instant::now() < until);
-            if !backing_off {
-                match recover_guard_from_watchdog(&core) {
-                    Ok(()) => {
-                        failures = 0;
-                        backoff_until = None;
-                    }
-                    Err(err) => {
-                        failures += 1;
+            thread::sleep(interval);
+            continue;
+        }
+
+        if let Some(until) = backoff_until {
+            let now = Instant::now();
+            if now < until {
+                thread::sleep(watchdog_backoff_sleep(now, until));
+                continue;
+            }
+            backoff_until = None;
+        }
+
+        if !input_guard_running() {
+            match recover_guard_from_watchdog(&core) {
+                Ok(()) => {
+                    failures = 0;
+                    backoff_until = None;
+                }
+                Err(err) => {
+                    failures += 1;
+                    eprintln!(
+                        "prompt-parole watchdog: could not start input guard (attempt {failures}): {err}"
+                    );
+                    // Stop opening recovery windows on a loop when the guard
+                    // cannot stay up (usually missing Accessibility/Input
+                    // Monitoring permission); back off and try again later.
+                    if failures >= WATCHDOG_MAX_ATTEMPTS {
                         eprintln!(
-                            "prompt-parole watchdog: could not start input guard (attempt {failures}): {err}"
+                            "prompt-parole watchdog: backing off for {} minutes. Grant Accessibility/Input Monitoring permission to prompt-parole, then it will retry.",
+                            WATCHDOG_BACKOFF.as_secs() / 60
                         );
-                        // Stop opening recovery windows on a loop when the guard
-                        // cannot stay up (usually missing Accessibility/Input
-                        // Monitoring permission); back off and try again later.
-                        if failures >= WATCHDOG_MAX_ATTEMPTS {
-                            eprintln!(
-                                "prompt-parole watchdog: backing off for {} minutes. Grant Accessibility/Input Monitoring permission to prompt-parole, then it will retry.",
-                                WATCHDOG_BACKOFF.as_secs() / 60
-                            );
-                            backoff_until = Some(Instant::now() + WATCHDOG_BACKOFF);
-                            failures = 0;
-                        }
+                        backoff_until = Some(Instant::now() + WATCHDOG_BACKOFF);
+                        failures = 0;
                     }
                 }
             }
@@ -3383,7 +3401,7 @@ fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, St
             failures = 0;
             backoff_until = None;
         }
-        thread::sleep(StdDuration::from_secs(interval_seconds));
+        thread::sleep(interval);
     }
 }
 
@@ -6136,6 +6154,21 @@ mod tests {
         assert!(plist.contains("<string>--interval-seconds</string>"));
         assert!(plist.contains("<string>2</string>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn watchdog_backoff_sleep_is_bounded() {
+        let now = Instant::now();
+
+        assert_eq!(
+            watchdog_backoff_sleep(now, now + StdDuration::from_secs(300)),
+            StdDuration::from_secs(60)
+        );
+        assert_eq!(
+            watchdog_backoff_sleep(now, now + StdDuration::from_secs(12)),
+            StdDuration::from_secs(12)
+        );
+        assert_eq!(watchdog_backoff_sleep(now, now), StdDuration::from_secs(0));
     }
 
     #[test]
