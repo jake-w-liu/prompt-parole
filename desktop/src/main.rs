@@ -1373,12 +1373,20 @@ fn notice_banner(ui: &mut egui::Ui, notice: &str) {
 }
 
 fn normalize_gui_viewport(ctx: &egui::Context) {
+    // Open tall enough that the tallest tab (Schedule) shows without scrolling,
+    // capped to the monitor so it stays on screen on small displays. The user can
+    // still shrink it (min size below), and then the ScrollArea takes over.
+    const TARGET_INNER_HEIGHT: f32 = 840.0;
+    let height = match ctx.input(|input| input.viewport().monitor_size) {
+        Some(monitor) if monitor.y > 0.0 => TARGET_INNER_HEIGHT.min(monitor.y * 0.9),
+        _ => TARGET_INNER_HEIGHT,
+    };
     ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-        620.0, 400.0,
+        620.0, 360.0,
     )));
-    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(760.0, 460.0)));
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(760.0, height)));
     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-        120.0, 90.0,
+        120.0, 60.0,
     )));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
 }
@@ -4791,8 +4799,8 @@ fn run_gui() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Prompt Parole")
-            .with_inner_size([760.0, 460.0])
-            .with_min_inner_size([620.0, 400.0])
+            .with_inner_size([760.0, 840.0])
+            .with_min_inner_size([620.0, 360.0])
             .with_icon(std::sync::Arc::new(icon_data())),
         centered: true,
         persist_window: false,

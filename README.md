@@ -9,8 +9,6 @@ separate `prompt-parole unlock` command or the local GUI. You can still inspect
 files, watch progress, read diffs, and generally look responsible. You just
 cannot keep feeding the prompt machine after curfew without parole.
 
-Repository: <https://github.com/jake-w-liu/prompt-parole>
-
 ## What It Does
 
 - Blocks Claude Code and Codex prompts during configured hours.
@@ -116,10 +114,7 @@ zone.
 
 `prompt-parole` with no subcommand opens the native GUI. `prompt-parole gui`
 does the same thing. Saving settings, changing the password, and temporary
-unlocks all require the current password. The GUI uses a restrained traditional
-Japanese palette inspired by Nippon Colors and Sanzo Wada-style
-color-combination references, because a relationship-saving tool should not look
-like a router admin page.
+unlocks all require the current password. 
 
 The configured desktop view is tabbed so the window can stay small:
 **Status**, **Schedule**, **Unlock**, **Password**, and **Protection**. Use
