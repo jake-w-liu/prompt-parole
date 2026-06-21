@@ -106,6 +106,8 @@ prompt-parole guard-agent --action start
 prompt-parole guard-agent --action stop
 prompt-parole guard-agent --action status
 prompt-parole install-app
+prompt-parole install-vscode
+prompt-parole uninstall-vscode
 prompt-parole gui
 ```
 
@@ -220,7 +222,7 @@ not silently reopen prompting.
 
 ## Protection Layers
 
-Prompt Parole has three local layers:
+Prompt Parole has four local layers:
 
 1. **Input Guard** blocks prompt-entry keys in the currently focused macOS
    Codex/Claude terminal window during curfew, while output stays visible.
@@ -229,12 +231,33 @@ Prompt Parole has three local layers:
 3. **Launch wrappers** block new `codex` and `claude` process launches during
    curfew. The wrappers live in `~/.local/bin`, which should appear before
    Homebrew or system binary directories in `PATH`.
+4. **VS Code extensions** (Claude Code and Codex) are gated by pointing each
+   extension's agent-launch setting at a Prompt Parole shim. Run
+   `prompt-parole install-vscode` (or the **Cover VS Code Extensions** button on
+   the Protection tab), then reload VS Code.
 
 This does not intercept hosted web chats or remote surfaces that do not run
 through your local Claude/Codex process. It also cannot rewrite a process that
 was already running and ignoring hooks. Prompt Parole intentionally does not
 pause or kill running agent processes, because that would also stop or hide the
 progress you wanted to inspect.
+
+### VS Code extensions
+
+The Claude Code and Codex VS Code extensions do not currently fire the
+`UserPromptSubmit` hook (an upstream limitation), so the hook layer cannot gate
+them. Instead, `install-vscode` writes a small shim and sets the extensions'
+agent-launch settings to point at it:
+
+- Claude Code's `claudeCode.claudeProcessWrapper`
+- Codex's (`openai.chatgpt`) `chatgpt.cliExecutable`
+
+During curfew the shim runs `prompt-parole check` and refuses to start the agent;
+outside curfew it execs the real agent unchanged. Like the launch wrappers, this
+blocks **new** agent sessions during curfew — a chat session already open when
+curfew begins keeps working until VS Code is reloaded. `uninstall-vscode` removes
+the settings and shim. (Other AI extensions such as GitHub Copilot Chat cannot be
+gated this way; VS Code does not let one extension intercept another's prompts.)
 
 ## Security Model
 

@@ -861,6 +861,7 @@ struct ProtectionStatus {
     claude_path_uses_launcher: bool,
     input_guard_running: bool,
     mac_app_installed: bool,
+    vscode_guarded: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1251,6 +1252,14 @@ impl PromptParoleApp {
         });
     }
 
+    fn install_vscode(&mut self, ctx: &egui::Context) {
+        let password = self.passwords.install_current.clone();
+        self.spawn_action(ctx, "Covering VS Code…", false, move |core| {
+            gui_require_install_password(core, &password)?;
+            install_vscode_wrappers(core)
+        });
+    }
+
     fn window_values(&self) -> Result<Vec<String>, String> {
         if self.windows.is_empty() {
             return Err("At least one lock window is required.".to_owned());
@@ -1275,14 +1284,20 @@ impl PromptParoleApp {
     }
 }
 
-/// Install hooks + launchers, honoring the same password gate the CLI uses.
-fn gui_install_protection(core: &ParoleCore, password: &str) -> Result<String, String> {
+/// Enforce the same "install" password gate the CLI uses, for GUI install actions.
+fn gui_require_install_password(core: &ParoleCore, password: &str) -> Result<(), String> {
     if core.is_configured() {
         let config = core.load_config()?;
         if config.password_required_for.iter().any(|a| a == "install") {
             core.assert_password(password)?;
         }
     }
+    Ok(())
+}
+
+/// Install hooks + launchers, honoring the same password gate the CLI uses.
+fn gui_install_protection(core: &ParoleCore, password: &str) -> Result<String, String> {
+    gui_require_install_password(core, password)?;
     let mut installed = 0;
     for target in ["claude", "codex"] {
         let path = target_path(target, None)?;
@@ -1661,6 +1676,14 @@ fn protection_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
             "Codex enforces via the launcher; its prompt hook also needs to be trusted inside Codex.",
         );
         ui.add_space(8.0);
+        if full_secondary_button(ui, "Cover VS Code Extensions").clicked() {
+            app.install_vscode(ui.ctx());
+        }
+        meta_label(
+            ui,
+            "Gate the Claude Code & Codex VS Code extensions (reload VS Code after).",
+        );
+        ui.add_space(8.0);
         if full_secondary_button(ui, "Install Mac App").clicked() {
             app.install_app_bundle(ui.ctx());
         }
@@ -2012,6 +2035,15 @@ fn protection_summary(ui: &mut egui::Ui, protection: &ProtectionStatus) {
     );
     protection_status_row(
         ui,
+        "VS Code extensions",
+        protection
+            .vscode_guarded
+            .then_some("Ready after reload")
+            .or(Some("Needs setup")),
+        None,
+    );
+    protection_status_row(
+        ui,
         "Mac app menu",
         protection.mac_app_installed.then_some("Installed"),
         Some("Needs install"),
@@ -2041,7 +2073,7 @@ fn protection_status_row(
 ) {
     let status = positive_status.unwrap_or_else(|| fallback_status.unwrap_or("Off"));
     let color = match status {
-        "Protected" | "Installed" | "Ready after restart" => tokiwa(),
+        "Protected" | "Installed" | "Ready after restart" | "Ready after reload" => tokiwa(),
         "Not first in PATH" => yamabuki(),
         _ => enji(),
     };
@@ -2473,6 +2505,15 @@ enum CommandKind {
         #[arg(long)]
         app_dir: Option<PathBuf>,
     },
+    /// Gate the Claude Code and Codex VS Code extensions during curfew.
+    InstallVscode {
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    UninstallVscode {
+        #[arg(long)]
+        password_stdin: bool,
+    },
     Launch {
         #[arg(long)]
         agent: String,
@@ -2763,6 +2804,16 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
         CommandKind::InstallApp { app_dir } => {
             let path = install_macos_app_bundle(app_dir.as_deref())?;
             println!("Installed Prompt Parole app at {}.", path.display());
+            Ok(0)
+        }
+        CommandKind::InstallVscode { password_stdin } => {
+            require_action_password(core, password_stdin, "install")?;
+            println!("{}", install_vscode_wrappers(core)?);
+            Ok(0)
+        }
+        CommandKind::UninstallVscode { password_stdin } => {
+            require_action_password(core, password_stdin, "uninstall")?;
+            println!("{}", uninstall_vscode_wrappers(core)?);
             Ok(0)
         }
         CommandKind::Launch { agent, real, args } => launch_agent(core, &agent, &real, &args),
@@ -3964,6 +4015,11 @@ fn protection_status() -> ProtectionStatus {
         claude_path_uses_launcher: command_uses_launcher("claude"),
         input_guard_running: input_guard_running(),
         mac_app_installed: macos_app_bundle_installed(),
+        vscode_guarded: {
+            let core = ParoleCore { app_dir: app_dir() };
+            vscode_wrapper_configured(&core, VSCODE_CLAUDE_SETTING)
+                || vscode_wrapper_configured(&core, VSCODE_CODEX_SETTING)
+        },
     }
 }
 
@@ -4598,6 +4654,158 @@ fn ensure_hook_marker(command: &str) -> String {
     } else {
         format!("PROMPT_PAROLE_HOOK=1 {command}")
     }
+}
+
+// ---------------------------------------------------------------------------
+// VS Code extension coverage.
+//
+// The Claude Code / Codex VS Code extensions do not fire the settings.json /
+// hooks.json prompt-submit hook (an upstream bug), so the hook layer can't gate
+// them. Instead we point each extension's "launch the agent process" setting at a
+// thin Prompt Parole shim that runs `prompt-parole check` and refuses during
+// curfew, otherwise execs the real agent transparently. This blocks NEW agent
+// sessions in the extension during curfew (a session already open when curfew
+// starts keeps running until reload — same guarantee as the CLI launchers).
+// ---------------------------------------------------------------------------
+
+const VSCODE_CLAUDE_SETTING: &str = "claudeCode.claudeProcessWrapper";
+const VSCODE_CODEX_SETTING: &str = "chatgpt.cliExecutable";
+
+fn vscode_wrapper_dir(core: &ParoleCore) -> PathBuf {
+    core.app_dir.join("vscode")
+}
+
+fn vscode_user_settings_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "Could not find home directory.".to_owned())?;
+    #[cfg(target_os = "macos")]
+    let path = home.join("Library/Application Support/Code/User/settings.json");
+    #[cfg(not(target_os = "macos"))]
+    let path = home.join(".config/Code/User/settings.json");
+    Ok(path)
+}
+
+/// Body that resolves the real agent and execs it. `$@` from Claude Code already
+/// starts with the bundled binary; Codex's cliExecutable IS the binary, so we
+/// resolve the latest bundled codex and exec it with the args.
+fn vscode_wrapper_script(prompt_parole_exe: &Path, exec_body: &str) -> String {
+    // `check` exits 1 only when configured AND currently blocked; 0 (allowed) and 2
+    // (unconfigured/error) both fall through to running the agent, matching Prompt
+    // Parole's "unconfigured = allow" behavior.
+    format!(
+        "#!/bin/sh\n# PROMPT_PAROLE_LAUNCHER=1\n# Managed by Prompt Parole — gates the VS Code agent during curfew.\n{} check >/dev/null 2>&1\nif [ \"$?\" -eq 1 ]; then\n  echo 'Prompt Parole: curfew is active — new sessions are blocked until your unlock window.' >&2\n  exit 1\nfi\n{}\n",
+        shell_quote(&prompt_parole_exe.to_string_lossy()),
+        exec_body,
+    )
+}
+
+fn write_vscode_wrapper(path: &Path, contents: &str) -> Result<(), String> {
+    fs::write(path, contents)
+        .map_err(|err| format!("Could not write {}: {err}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .map_err(|err| format!("Could not make {} executable: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn install_vscode_wrappers(core: &ParoleCore) -> Result<String, String> {
+    let dir = vscode_wrapper_dir(core);
+    ensure_private_dir(&dir)?;
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("prompt-parole"));
+    let claude_wrapper = dir.join("vscode-claude-wrapper.sh");
+    let codex_wrapper = dir.join("vscode-codex-wrapper.sh");
+    // Claude Code invokes: <wrapper> <bundled-binary> <args...> — exec passes through.
+    write_vscode_wrapper(&claude_wrapper, &vscode_wrapper_script(&exe, "exec \"$@\""))?;
+    // Codex (openai.chatgpt) treats cliExecutable AS codex, so resolve the bundled
+    // codex (latest version) and exec it with the args.
+    let codex_body = "real=$(ls -t \"$HOME\"/.vscode/extensions/openai.chatgpt-*/bin/*/codex 2>/dev/null | head -1)\n[ -n \"$real\" ] || real=codex\nexec \"$real\" \"$@\"";
+    write_vscode_wrapper(&codex_wrapper, &vscode_wrapper_script(&exe, codex_body))?;
+
+    let settings = vscode_user_settings_path()?;
+    let mut data = load_vscode_settings(&settings)?;
+    let object = data
+        .as_object_mut()
+        .ok_or_else(|| "VS Code settings.json must contain a JSON object.".to_owned())?;
+    object.insert(
+        VSCODE_CLAUDE_SETTING.to_owned(),
+        serde_json::Value::String(claude_wrapper.to_string_lossy().into_owned()),
+    );
+    object.insert(
+        VSCODE_CODEX_SETTING.to_owned(),
+        serde_json::Value::String(codex_wrapper.to_string_lossy().into_owned()),
+    );
+    let backup = backup_file(&settings)?;
+    write_json_shared(&settings, &data)?;
+    let restart = "Reload/restart VS Code so the extensions pick up the wrapper.";
+    Ok(match backup {
+        Some(path) => format!(
+            "Configured VS Code Claude Code + Codex extensions. {restart} (settings backup: {})",
+            path.display()
+        ),
+        None => format!("Configured VS Code Claude Code + Codex extensions. {restart}"),
+    })
+}
+
+fn uninstall_vscode_wrappers(core: &ParoleCore) -> Result<String, String> {
+    let dir = vscode_wrapper_dir(core);
+    let settings = vscode_user_settings_path()?;
+    let mut removed = 0;
+    if settings.exists() {
+        let mut data = load_vscode_settings(&settings)?;
+        if let Some(object) = data.as_object_mut() {
+            for key in [VSCODE_CLAUDE_SETTING, VSCODE_CODEX_SETTING] {
+                // Only remove the key if it still points at one of our wrappers.
+                let ours = object
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| Path::new(value).starts_with(&dir));
+                if ours {
+                    object.remove(key);
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            let _ = backup_file(&settings)?;
+            write_json_shared(&settings, &data)?;
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+    Ok(format!("Removed VS Code coverage ({removed} setting(s))."))
+}
+
+/// Load VS Code settings.json, with a clearer error for the common JSONC case
+/// (comments / trailing commas), which serde_json cannot parse.
+fn load_vscode_settings(path: &Path) -> Result<serde_json::Value, String> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|err| {
+        format!(
+            "Could not parse {} ({err}). If it contains comments or trailing commas, add these keys \
+             manually instead: \"{VSCODE_CLAUDE_SETTING}\" and \"{VSCODE_CODEX_SETTING}\".",
+            path.display()
+        )
+    })
+}
+
+fn vscode_wrapper_configured(core: &ParoleCore, key: &str) -> bool {
+    let Ok(settings) = vscode_user_settings_path() else {
+        return false;
+    };
+    let dir = vscode_wrapper_dir(core);
+    load_vscode_settings(&settings)
+        .ok()
+        .and_then(|data| {
+            data.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(|value| Path::new(value).starts_with(&dir))
+        })
+        .unwrap_or(false)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -5246,6 +5454,32 @@ mod tests {
         let script = fs::read_to_string(wrapper).unwrap();
         assert!(script.contains("launch --agent codex"));
         assert!(script.contains("--real /opt/homebrew/bin/codex"));
+    }
+
+    #[test]
+    fn vscode_wrapper_gates_on_curfew_and_is_marked() {
+        let script = vscode_wrapper_script(Path::new("/tmp/prompt-parole"), "exec \"$@\"");
+        // It must be recognizable as ours, gate via `check`, and pass through otherwise.
+        assert!(script.contains("PROMPT_PAROLE_LAUNCHER=1"));
+        assert!(script.contains("/tmp/prompt-parole check"));
+        assert!(script.contains("exit 1"));
+        assert!(script.contains("exec \"$@\""));
+    }
+
+    #[test]
+    fn vscode_settings_rejects_jsonc_with_a_helpful_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // JSONC (comment) — serde_json can't parse it; we must error, not clobber.
+        fs::write(&path, "{\n  // a comment\n  \"editor.fontSize\": 13\n}\n").unwrap();
+        let err = load_vscode_settings(&path).unwrap_err();
+        assert!(err.contains("manually"));
+        // A clean object loads fine.
+        fs::write(&path, "{\"editor.fontSize\": 13}\n").unwrap();
+        assert_eq!(
+            load_vscode_settings(&path).unwrap()["editor.fontSize"],
+            serde_json::json!(13)
+        );
     }
 
     #[test]
