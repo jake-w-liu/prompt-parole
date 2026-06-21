@@ -1343,11 +1343,11 @@ fn busy_banner(ui: &mut egui::Ui, label: &str) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(16.0).color(aomidori()));
+                ui.add(egui::Spinner::new().size(16.0).color(tokiwa()));
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(label)
-                        .color(aomidori())
+                        .color(tokiwa())
                         .strong()
                         .size(14.0),
                 );
@@ -1365,7 +1365,7 @@ fn notice_banner(ui: &mut egui::Ui, notice: &str) {
             ui.set_width(ui.available_width());
             ui.label(
                 egui::RichText::new(notice)
-                    .color(aomidori())
+                    .color(tokiwa())
                     .strong()
                     .size(13.5),
             );
@@ -1434,11 +1434,11 @@ fn tab_bar(ui: &mut egui::Ui, active_tab: &mut AppTab) {
                 for tab in AppTab::ALL {
                     let selected = *active_tab == tab;
                     let fill = if selected {
-                        aomidori()
+                        tokiwa()
                     } else {
                         egui::Color32::TRANSPARENT
                     };
-                    let text_color = if selected { button_fg() } else { aomidori() };
+                    let text_color = if selected { button_fg() } else { tokiwa() };
                     let response = ui.add(
                         egui::Button::new(
                             egui::RichText::new(tab.label())
@@ -1447,7 +1447,7 @@ fn tab_bar(ui: &mut egui::Ui, active_tab: &mut AppTab) {
                                 .color(text_color),
                         )
                         .fill(fill)
-                        .stroke(egui::Stroke::new(1.0, aomidori()))
+                        .stroke(egui::Stroke::new(1.0, tokiwa()))
                         .corner_radius(egui::CornerRadius::same(6))
                         .min_size(egui::vec2(96.0, 32.0)),
                     );
@@ -1678,15 +1678,15 @@ fn labeled_duration(ui: &mut egui::Ui, label: &str, value: &mut i64) {
         for (caption, minutes) in [("15m", 15), ("30m", 30), ("1h", 60), ("2h", 120)] {
             let selected = *value == minutes;
             let fill = if selected {
-                aomidori()
+                tokiwa()
             } else {
                 egui::Color32::TRANSPARENT
             };
-            let text_color = if selected { button_fg() } else { aomidori() };
+            let text_color = if selected { button_fg() } else { tokiwa() };
             let response = ui.add(
                 egui::Button::new(egui::RichText::new(caption).size(12.5).color(text_color))
                     .fill(fill)
-                    .stroke(egui::Stroke::new(1.0, aomidori()))
+                    .stroke(egui::Stroke::new(1.0, tokiwa()))
                     .corner_radius(egui::CornerRadius::same(6))
                     .min_size(egui::vec2(40.0, 26.0)),
             );
@@ -1715,8 +1715,8 @@ fn full_primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
                 .strong()
                 .size(14.0),
         )
-        .fill(aomidori())
-        .stroke(egui::Stroke::new(1.0, aomidori()))
+        .fill(tokiwa())
+        .stroke(egui::Stroke::new(1.0, tokiwa()))
         .corner_radius(egui::CornerRadius::same(6)),
     )
 }
@@ -1726,12 +1726,12 @@ fn full_secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         [ui.available_width(), 34.0],
         egui::Button::new(
             egui::RichText::new(label)
-                .color(aomidori())
+                .color(tokiwa())
                 .strong()
                 .size(14.0),
         )
         .fill(egui::Color32::TRANSPARENT)
-        .stroke(egui::Stroke::new(1.0, aomidori()))
+        .stroke(egui::Stroke::new(1.0, tokiwa()))
         .corner_radius(egui::CornerRadius::same(6)),
     )
 }
@@ -1740,12 +1740,12 @@ fn compact_secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(
             egui::RichText::new(label)
-                .color(aomidori())
+                .color(tokiwa())
                 .strong()
                 .size(13.0),
         )
         .fill(egui::Color32::TRANSPARENT)
-        .stroke(egui::Stroke::new(1.0, aomidori()))
+        .stroke(egui::Stroke::new(1.0, tokiwa()))
         .corner_radius(egui::CornerRadius::same(6))
         .min_size(egui::vec2(72.0, 28.0)),
     )
@@ -1853,7 +1853,7 @@ fn password_suggestion(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
             ui.label(
                 egui::RichText::new(&app.generated_password)
                     .monospace()
-                    .color(aomidori())
+                    .color(tokiwa())
                     .strong(),
             );
         }
@@ -1876,8 +1876,11 @@ fn app_header(ui: &mut egui::Ui, status: Option<&StatusPayload>, configured: boo
             status_pill(ui, status, configured);
         });
     });
-    ui.add_space(10.0);
-    palette_strip(ui);
+    ui.add_space(6.0);
+    // A thin hairline rule under the title (replaces the old decorative palette bar).
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, line());
 }
 
 /// (text, background, foreground) for the live status pill.
@@ -1886,33 +1889,12 @@ fn pill_style(status: Option<&StatusPayload>, configured: bool) -> (&'static str
         return ("Not configured", yamabuki(), sumi());
     }
     match status {
-        Some(status) if status.allowed => ("Prompts allowed", aomidori(), button_fg()),
+        Some(status) if status.allowed => ("Prompts allowed", tokiwa(), button_fg()),
         Some(_) => ("Prompts blocked", enji(), button_fg()),
         None => ("Status unavailable", rikyunezumi(), button_fg()),
     }
 }
 
-fn palette_strip(ui: &mut egui::Ui) {
-    let colors = [
-        shironeri(),
-        torinoko(),
-        seiji(),
-        aomidori(),
-        asagi(),
-        yamabuki(),
-        enji(),
-        sumi(),
-    ];
-    let available = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(available, 8.0), egui::Sense::hover());
-    let width = rect.width() / colors.len() as f32;
-    for (index, color) in colors.iter().enumerate() {
-        let min = egui::pos2(rect.min.x + width * index as f32, rect.min.y);
-        let max = egui::pos2(rect.min.x + width * (index + 1) as f32, rect.max.y);
-        ui.painter()
-            .rect_filled(egui::Rect::from_min_max(min, max), 0.0, *color);
-    }
-}
 
 fn status_pill(ui: &mut egui::Ui, status: Option<&StatusPayload>, configured: bool) {
     let (text, fill, text_color) = pill_style(status, configured);
@@ -1932,7 +1914,7 @@ fn status_pill(ui: &mut egui::Ui, status: Option<&StatusPayload>, configured: bo
 
 fn status_summary(ui: &mut egui::Ui, status: &StatusPayload) {
     let (label, color) = if status.allowed {
-        ("PROMPTS ALLOWED", aomidori())
+        ("PROMPTS ALLOWED", tokiwa())
     } else {
         ("PROMPTS BLOCKED", enji())
     };
@@ -2014,7 +1996,7 @@ fn protection_status_row(
 ) {
     let status = positive_status.unwrap_or_else(|| fallback_status.unwrap_or("Off"));
     let color = match status {
-        "Protected" | "Installed" | "Ready after restart" => aomidori(),
+        "Protected" | "Installed" | "Ready after restart" => tokiwa(),
         "Not first in PATH" => yamabuki(),
         _ => enji(),
     };
@@ -2057,7 +2039,7 @@ fn subsection_title(ui: &mut egui::Ui, title: &str) {
         egui::RichText::new(title)
             .size(15.0)
             .strong()
-            .color(aomidori()),
+            .color(tokiwa()),
     );
     ui.add_space(4.0);
 }
@@ -2102,8 +2084,8 @@ fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
                 .strong()
                 .size(14.0),
         )
-        .fill(aomidori())
-        .stroke(egui::Stroke::new(1.0, aomidori()))
+        .fill(tokiwa())
+        .stroke(egui::Stroke::new(1.0, tokiwa()))
         .corner_radius(egui::CornerRadius::same(6))
         .min_size(egui::vec2(120.0, 34.0)),
     )
@@ -2113,12 +2095,12 @@ fn secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
         egui::Button::new(
             egui::RichText::new(label)
-                .color(aomidori())
+                .color(tokiwa())
                 .strong()
                 .size(14.0),
         )
         .fill(egui::Color32::TRANSPARENT)
-        .stroke(egui::Stroke::new(1.0, aomidori()))
+        .stroke(egui::Stroke::new(1.0, tokiwa()))
         .corner_radius(egui::CornerRadius::same(6))
         .min_size(egui::vec2(96.0, 32.0)),
     )
@@ -2245,63 +2227,84 @@ fn apply_style(ctx: &egui::Context) {
     visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, sumi());
     visuals.widgets.active.bg_fill = seiji();
     visuals.widgets.active.weak_bg_fill = seiji();
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, aomidori());
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, tokiwa());
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, sumi());
     visuals.window_stroke = egui::Stroke::new(1.0, line());
     style.visuals = visuals;
     ctx.set_global_style(style);
 }
 
+// Every color below is an exact value from nipponcolors.com (a traditional
+// Japanese color). Roles are chosen so text always meets WCAG contrast: light
+// accents (torinoko/seiji/asagi/yamabuki) carry sumi (dark) text; dark accents
+// (tokiwa/enji) carry gofun (white) text.
+
+/// Shironeri 白練 — warm off-white. Page background and inset fields.
 fn shironeri() -> egui::Color32 {
     egui::Color32::from_rgb(252, 250, 242)
 }
 
+/// Gofun 胡粉 — shell white. Cards/panels and text on dark fills.
+fn gofun() -> egui::Color32 {
+    egui::Color32::from_rgb(255, 255, 251)
+}
+
+/// Torinoko 鳥の子 — pale beige. Alerts and hover backgrounds.
 fn torinoko() -> egui::Color32 {
-    egui::Color32::from_rgb(249, 191, 69)
+    egui::Color32::from_rgb(218, 201, 166)
 }
 
+/// Seiji 青磁 — celadon. Pressed-widget background.
 fn seiji() -> egui::Color32 {
-    egui::Color32::from_rgb(129, 156, 139)
+    egui::Color32::from_rgb(105, 176, 172)
 }
 
-fn aomidori() -> egui::Color32 {
-    egui::Color32::from_rgb(58, 105, 96)
+/// Tokiwa 常磐色 — deep evergreen. Primary actions/accents (readable as both a
+/// fill with white text and as text on white, unlike the brighter Aomidori).
+fn tokiwa() -> egui::Color32 {
+    egui::Color32::from_rgb(0, 123, 67)
 }
 
+/// Asagi 浅葱 — light indigo. Selection highlight and the busy indicator.
 fn asagi() -> egui::Color32 {
-    egui::Color32::from_rgb(72, 146, 155)
+    egui::Color32::from_rgb(51, 166, 184)
 }
 
+/// Yamabuki 山吹 — golden. "Not configured" state.
 fn yamabuki() -> egui::Color32 {
-    egui::Color32::from_rgb(255, 164, 0)
+    egui::Color32::from_rgb(255, 177, 27)
 }
 
+/// Enji 臙脂 — dark crimson. Errors and the "blocked" state.
 fn enji() -> egui::Color32 {
-    egui::Color32::from_rgb(157, 41, 51)
+    egui::Color32::from_rgb(159, 53, 58)
 }
 
+/// Sumi 墨 — ink black. Primary text.
 fn sumi() -> egui::Color32 {
-    egui::Color32::from_rgb(39, 34, 31)
+    egui::Color32::from_rgb(28, 28, 28)
 }
 
+/// Rikyū-nezumi 利休鼠 — muted grey-green. Secondary/meta text.
 fn rikyunezumi() -> egui::Color32 {
-    egui::Color32::from_rgb(101, 98, 85)
+    egui::Color32::from_rgb(112, 124, 116)
 }
 
 fn panel() -> egui::Color32 {
-    egui::Color32::from_rgb(255, 255, 251)
+    gofun()
 }
 
 fn field() -> egui::Color32 {
-    egui::Color32::from_rgb(246, 251, 247)
+    shironeri()
 }
 
+/// Hairline rule: Sumi at low opacity.
 fn line() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(57, 52, 50, 58)
+    egui::Color32::from_rgba_unmultiplied(28, 28, 28, 46)
 }
 
 fn button_fg() -> egui::Color32 {
-    egui::Color32::from_rgb(255, 255, 251)
+    gofun()
 }
 
 #[derive(Parser)]
@@ -4668,7 +4671,7 @@ fn backup_file(path: &Path) -> Result<Option<PathBuf>, String> {
 /// shironeri padlock. Only Nippon palette colors are used.
 fn render_icon(size: u32) -> Vec<u8> {
     let s = size as f32;
-    let bg = aomidori(); // deep green tile
+    let bg = tokiwa(); // deep green tile
     let fg = shironeri(); // off-white lock
 
     // Rounded tile, leaving a margin so it reads as a floating macOS app icon.
@@ -5364,14 +5367,17 @@ mod tests {
     }
 
     #[test]
-    fn nippon_palette_values_are_stable() {
-        assert_eq!(shironeri(), egui::Color32::from_rgb(252, 250, 242));
-        assert_eq!(torinoko(), egui::Color32::from_rgb(249, 191, 69));
-        assert_eq!(seiji(), egui::Color32::from_rgb(129, 156, 139));
-        assert_eq!(aomidori(), egui::Color32::from_rgb(58, 105, 96));
-        assert_eq!(asagi(), egui::Color32::from_rgb(72, 146, 155));
-        assert_eq!(yamabuki(), egui::Color32::from_rgb(255, 164, 0));
-        assert_eq!(enji(), egui::Color32::from_rgb(157, 41, 51));
-        assert_eq!(sumi(), egui::Color32::from_rgb(39, 34, 31));
+    fn nippon_palette_values_are_exact_nipponcolors() {
+        // Exact hex from nipponcolors.com.
+        assert_eq!(shironeri(), egui::Color32::from_rgb(252, 250, 242)); // #FCFAF2
+        assert_eq!(gofun(), egui::Color32::from_rgb(255, 255, 251)); // #FFFFFB
+        assert_eq!(torinoko(), egui::Color32::from_rgb(218, 201, 166)); // #DAC9A6
+        assert_eq!(seiji(), egui::Color32::from_rgb(105, 176, 172)); // #69B0AC
+        assert_eq!(tokiwa(), egui::Color32::from_rgb(0, 123, 67)); // #007B43
+        assert_eq!(asagi(), egui::Color32::from_rgb(51, 166, 184)); // #33A6B8
+        assert_eq!(yamabuki(), egui::Color32::from_rgb(255, 177, 27)); // #FFB11B
+        assert_eq!(enji(), egui::Color32::from_rgb(159, 53, 58)); // #9F353A
+        assert_eq!(sumi(), egui::Color32::from_rgb(28, 28, 28)); // #1C1C1C
+        assert_eq!(rikyunezumi(), egui::Color32::from_rgb(112, 124, 116)); // #707C74
     }
 }
