@@ -58,7 +58,7 @@ Google Password Manager and browser-generated-password prompts are not involved.
 The desktop app and CLI are the same Rust binary, which keeps the hook logic and
 password hashing in one place. The interface uses a restrained palette drawn
 entirely from [Nippon Colors](https://nipponcolors.com/) (Tokiwa, Shironeri,
-Gofun, Sumi, Asagi, Yamabuki, Enji, Seiji, Torinoko, Rikyū-nezumi).
+Gofun, Sumi, Asagi, Yamabuki, Enji, Seiji, Torinoko, Nibi).
 
 Build and run it from the checkout:
 

@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
@@ -580,10 +580,24 @@ fn resolve_in_zone<Z: TimeZone>(tz: &Z, naive: NaiveDateTime, prefer_later: bool
                 earliest
             }
         }
-        LocalResult::None => tz
-            .from_local_datetime(&(naive + Duration::hours(1)))
-            .single()
-            .unwrap_or_else(|| tz.from_utc_datetime(&naive)),
+        LocalResult::None => {
+            // Spring-forward gap: the wall time does not exist. Step forward minute
+            // by minute to the first instant that does — the moment the clock jumps —
+            // so a boundary in the gap maps to the transition, not up to an hour off.
+            let mut probe = naive;
+            let limit = naive + Duration::hours(2);
+            loop {
+                probe += Duration::minutes(1);
+                if let LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) =
+                    tz.from_local_datetime(&probe)
+                {
+                    break dt;
+                }
+                if probe >= limit {
+                    break tz.from_utc_datetime(&naive);
+                }
+            }
+        }
     }
 }
 
@@ -1385,15 +1399,20 @@ fn normalize_gui_viewport(ctx: &egui::Context) {
     // Open tall enough that the tallest tab (Schedule) shows without scrolling,
     // capped to the monitor so it stays on screen on small displays. The user can
     // still shrink it (min size below), and then the ScrollArea takes over.
+    const TARGET_INNER_WIDTH: f32 = 760.0;
     const TARGET_INNER_HEIGHT: f32 = 840.0;
-    let height = match ctx.input(|input| input.viewport().monitor_size) {
-        Some(monitor) if monitor.y > 0.0 => TARGET_INNER_HEIGHT.min(monitor.y * 0.9),
-        _ => TARGET_INNER_HEIGHT,
+    let (width, height) = match ctx.input(|input| input.viewport().monitor_size) {
+        Some(monitor) if monitor.x > 0.0 && monitor.y > 0.0 => (
+            TARGET_INNER_WIDTH.min(monitor.x * 0.95),
+            TARGET_INNER_HEIGHT.min(monitor.y * 0.9),
+        ),
+        _ => (TARGET_INNER_WIDTH, TARGET_INNER_HEIGHT),
     };
     ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-        620.0, 360.0,
+        620.0_f32.min(width),
+        360.0,
     )));
-    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(760.0, height)));
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
     // Do NOT force OuterPosition: that overrides eframe's `centered` placement and
     // can push the window off-screen. Let the window stay where eframe centered it.
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1721,7 +1740,7 @@ fn field_label(ui: &mut egui::Ui, label: &str) {
         egui::RichText::new(label)
             .size(13.0)
             .strong()
-            .color(rikyunezumi()),
+            .color(nibi()),
     );
 }
 
@@ -1910,7 +1929,7 @@ fn pill_style(status: Option<&StatusPayload>, configured: bool) -> (&'static str
     match status {
         Some(status) if status.allowed => ("Prompts allowed", tokiwa(), button_fg()),
         Some(_) => ("Prompts blocked", enji(), button_fg()),
-        None => ("Status unavailable", rikyunezumi(), button_fg()),
+        None => ("Status unavailable", nibi(), button_fg()),
     }
 }
 
@@ -2073,7 +2092,7 @@ fn subsection_title(ui: &mut egui::Ui, title: &str) {
 fn meta_label(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(
         egui::RichText::new(text.into())
-            .color(rikyunezumi())
+            .color(nibi())
             .size(13.0),
     );
 }
@@ -2315,9 +2334,10 @@ fn sumi() -> egui::Color32 {
     egui::Color32::from_rgb(28, 28, 28)
 }
 
-/// Rikyū-nezumi 利休鼠 — muted grey-green. Secondary/meta text.
-fn rikyunezumi() -> egui::Color32 {
-    egui::Color32::from_rgb(112, 124, 116)
+/// Nibi 鈍 — dull dark grey. Secondary/meta text (passes WCAG AA on the panels,
+/// unlike the lighter Rikyū-nezumi).
+fn nibi() -> egui::Color32 {
+    egui::Color32::from_rgb(101, 103, 101)
 }
 
 fn panel() -> egui::Color32 {
@@ -2556,8 +2576,13 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             password_stdin,
             duration_minutes,
         } => {
+            // Resolve the duration (which may read config) BEFORE prompting, so a
+            // config error doesn't waste the user's password entry.
+            let minutes = match duration_minutes {
+                Some(value) => value,
+                None => core.load_config()?.unlock_duration_minutes,
+            };
             let password = read_current_password(password_stdin, "Password: ")?;
-            let minutes = duration_minutes.unwrap_or(core.load_config()?.unlock_duration_minutes);
             let expires = core.unlock(&password, minutes)?;
             println!("Unlocked until {}.", expires.format("%Y-%m-%d %H:%M:%S %Z"));
             Ok(0)
@@ -2685,6 +2710,7 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
                 let path = target_path(&target, home.as_deref())?;
                 let command = hook_command
                     .clone()
+                    .map(|command| ensure_hook_marker(&command))
                     .unwrap_or_else(|| default_hook_command(&target_agent(&target)));
                 let backup = install_json_hook(&path, &command, "Checking Prompt Parole curfew")?;
                 if let Some(path) = backup {
@@ -2884,6 +2910,11 @@ fn parse_targets(raw: &str) -> Result<Vec<String>, String> {
 /// so this only needs minute-granularity accuracy.
 static CURFEW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// PID of the focused window the poll thread last confirmed runs an agent via its
+/// process tree (0 = none). The event-tap callback consults this for the
+/// title-less-terminal fallback instead of spawning `ps` itself.
+static FOCUS_TARGET_PID: AtomicI32 = AtomicI32::new(0);
+
 const GUARD_FLAG_CONTROL: u64 = 1 << 18;
 const GUARD_FLAG_OPTION: u64 = 1 << 19;
 const GUARD_FLAG_COMMAND: u64 = 1 << 20;
@@ -2979,44 +3010,53 @@ fn run_input_guard(core: ParoleCore, poll_millis: u64) -> Result<i32, String> {
     }
     println!("Prompt Parole input guard is running.");
     println!("Output remains visible; keyboard input to locked Codex/Claude windows is blocked.");
-    // The poll thread tracks only the (slow-changing) curfew state; whether the
-    // focused window is a prompt target is re-checked live per keystroke in the
-    // event-tap callback, so a fast focus switch cannot slip a prompt through.
+    // The poll thread tracks the (slow-changing) curfew state AND the process-tree
+    // fallback (which spawns `ps`, so it must NOT run inside the event-tap callback).
+    // The callback re-checks the focused window's title live, so a focus switch can't
+    // slip a prompt through on the common (title-bearing) path.
     CURFEW_ACTIVE.store(guard_curfew_active(&core), Ordering::Relaxed);
+    FOCUS_TARGET_PID.store(focus_target_pid(), Ordering::Relaxed);
     let poll_core = core.clone();
     thread::spawn(move || {
         loop {
             CURFEW_ACTIVE.store(guard_curfew_active(&poll_core), Ordering::Relaxed);
+            FOCUS_TARGET_PID.store(focus_target_pid(), Ordering::Relaxed);
             thread::sleep(StdDuration::from_millis(poll_millis));
         }
     });
     platform_run_input_guard()
 }
 
-/// True if the currently focused window belongs to a Codex/Claude prompt target.
-/// Result is cached briefly: the event-tap callback calls this per blockable
-/// keystroke, and frontmost_window() (CGWindowList) is comparatively expensive.
-/// The short TTL keeps the focus-switch race tiny without per-key overhead.
+/// PID of the focused window if it is a terminal emulator whose process tree runs
+/// an agent (else 0). Runs in the poll thread (spawns `ps`), never in the callback.
+#[cfg(target_os = "macos")]
+fn focus_target_pid() -> i32 {
+    macos_front_window::frontmost_window()
+        .filter(|window| {
+            is_terminal_owner(&window.owner) && window.pid > 0 && pid_tree_runs_agent(window.pid)
+        })
+        .map(|window| window.pid)
+        .unwrap_or(0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn focus_target_pid() -> i32 {
+    0
+}
+
+/// True if the focused window is a Codex/Claude prompt target. Called live in the
+/// event-tap callback: a fast title/owner check (no `ps`), plus the cheap
+/// process-tree result the poll thread precomputed for this PID.
 #[cfg(target_os = "macos")]
 fn current_window_is_target() -> bool {
-    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
-    let mut guard = match CACHE.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+    let Some(window) = macos_front_window::frontmost_window() else {
+        return false;
     };
-    if let Some((stamp, value)) = guard.as_ref()
-        && stamp.elapsed() < StdDuration::from_millis(120)
-    {
-        return *value;
+    if window_is_agent_target(&window.owner, &window.title) {
+        return true;
     }
-    let previous = guard.as_ref().map(|(_, value)| *value).unwrap_or(false);
-    // On a transient CGWindowList failure, reuse the last known value rather than
-    // flipping to "not a target" (which would briefly let keys through during curfew).
-    let value = macos_front_window::frontmost_window()
-        .map(|window| window_info_is_target(&window))
-        .unwrap_or(previous);
-    *guard = Some((Instant::now(), value));
-    value
+    let tree_pid = FOCUS_TARGET_PID.load(Ordering::Relaxed);
+    window.pid > 0 && window.pid == tree_pid
 }
 
 #[cfg(target_os = "macos")]
@@ -4550,6 +4590,16 @@ fn default_hook_command(agent: &str) -> String {
     )
 }
 
+/// Ensure a custom hook command carries the Prompt Parole marker, so uninstall and
+/// status can recognize (and later remove) it.
+fn ensure_hook_marker(command: &str) -> String {
+    if command.contains("PROMPT_PAROLE_HOOK=1") || command.contains("prompt-parole hook --agent") {
+        command.to_owned()
+    } else {
+        format!("PROMPT_PAROLE_HOOK=1 {command}")
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     if value
         .chars()
@@ -5448,6 +5498,6 @@ mod tests {
         assert_eq!(yamabuki(), egui::Color32::from_rgb(255, 177, 27)); // #FFB11B
         assert_eq!(enji(), egui::Color32::from_rgb(159, 53, 58)); // #9F353A
         assert_eq!(sumi(), egui::Color32::from_rgb(28, 28, 28)); // #1C1C1C
-        assert_eq!(rikyunezumi(), egui::Color32::from_rgb(112, 124, 116)); // #707C74
+        assert_eq!(nibi(), egui::Color32::from_rgb(101, 103, 101)); // #656765
     }
 }
