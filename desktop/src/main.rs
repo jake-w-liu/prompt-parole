@@ -32,6 +32,13 @@ const PASSWORD_ACTIONS: [&str; 6] = [
     "unlock",
 ];
 const HARD_PASSWORD_ACTIONS: [&str; 3] = ["configure", "passwd", "unlock"];
+#[cfg(not(test))]
+const SCRYPT_LOG_N: u8 = 15;
+#[cfg(test)]
+const SCRYPT_LOG_N: u8 = 10;
+const SCRYPT_R: u32 = 8;
+const SCRYPT_P: u32 = 1;
+const SCRYPT_DKLEN: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Config {
@@ -613,19 +620,19 @@ fn hash_password(password: &str) -> Result<Secret, String> {
     validate_password(password)?;
     let mut salt = [0_u8; 16];
     rand::rng().fill(&mut salt);
-    let mut output = vec![0_u8; 32];
-    let params =
-        ScryptParams::new(15, 8, 1, 32).map_err(|err| format!("Invalid scrypt params: {err}"))?;
+    let mut output = vec![0_u8; SCRYPT_DKLEN];
+    let params = ScryptParams::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, SCRYPT_DKLEN)
+        .map_err(|err| format!("Invalid scrypt params: {err}"))?;
     scrypt(password.as_bytes(), &salt, &params, &mut output)
         .map_err(|err| format!("Could not hash password: {err}"))?;
     Ok(Secret {
         version: 1,
         kdf: "scrypt".to_owned(),
         params: SecretParams {
-            n: 2_u32.pow(15),
-            r: 8,
-            p: 1,
-            dklen: 32,
+            n: 2_u32.pow(SCRYPT_LOG_N as u32),
+            r: SCRYPT_R,
+            p: SCRYPT_P,
+            dklen: SCRYPT_DKLEN,
         },
         salt: general_purpose::STANDARD.encode(salt),
         hash: general_purpose::STANDARD.encode(output),
