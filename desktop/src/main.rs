@@ -21,6 +21,8 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+/// Upper bound on a temporary unlock (one year) — also the GUI duration control's max.
+const MAX_UNLOCK_MINUTES: i64 = 366 * 24 * 60;
 const PASSWORD_ACTIONS: [&str; 6] = [
     "configure",
     "disable",
@@ -33,11 +35,15 @@ const HARD_PASSWORD_ACTIONS: [&str; 3] = ["configure", "passwd", "unlock"];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Config {
+    // Defaulted so a config from a different version (added/missing optional fields)
+    // still loads; normalize_config validates the result afterward.
+    #[serde(default)]
     version: i64,
     timezone: String,
     unlock_duration_minutes: i64,
     password_required_for: Vec<String>,
     lock_windows: Vec<LockWindow>,
+    #[serde(default)]
     log_prompt_text: bool,
 }
 
@@ -257,7 +263,6 @@ impl ParoleCore {
         }
         // Cap at one year so a huge value cannot overflow chrono's date math (which
         // would otherwise panic).
-        const MAX_UNLOCK_MINUTES: i64 = 366 * 24 * 60;
         if duration_minutes > MAX_UNLOCK_MINUTES {
             return Err("Unlock duration must be at most one year.".to_owned());
         }
@@ -379,9 +384,10 @@ fn normalize_config(mut config: Config) -> Result<Config, String> {
     if config.lock_windows.is_empty() {
         return Err("At least one lock window is required.".to_owned());
     }
-    for window in &config.lock_windows {
-        parse_hhmm(&window.start)?;
-        parse_hhmm(&window.end)?;
+    for window in &mut config.lock_windows {
+        // Canonicalize so comparison/storage are by actual time, not raw string.
+        window.start = canonical_hhmm(&window.start)?;
+        window.end = canonical_hhmm(&window.end)?;
         if window.start == window.end {
             return Err("Lock window start and end cannot be the same.".to_owned());
         }
@@ -426,8 +432,8 @@ fn parse_window(value: &str) -> Result<LockWindow, String> {
     let (start, end) = time_part
         .split_once('-')
         .ok_or_else(|| "Lock window must look like HH:MM-HH:MM.".to_owned())?;
-    parse_hhmm(start)?;
-    parse_hhmm(end)?;
+    let start = canonical_hhmm(start)?;
+    let end = canonical_hhmm(end)?;
     if start == end {
         return Err("Lock window start and end cannot be the same.".to_owned());
     }
@@ -444,16 +450,18 @@ fn parse_window(value: &str) -> Result<LockWindow, String> {
             })
             .collect()
     };
-    Ok(LockWindow {
-        start: start.to_owned(),
-        end: end.to_owned(),
-        days,
-    })
+    Ok(LockWindow { start, end, days })
 }
 
 fn parse_hhmm(value: &str) -> Result<NaiveTime, String> {
     NaiveTime::parse_from_str(value, "%H:%M")
         .map_err(|_| format!("Invalid time {value:?}; expected HH:MM."))
+}
+
+/// Parse a time and return its canonical `HH:MM` form, so equality/storage are by
+/// actual time rather than by raw string (e.g. "9:00" and "09:00" are the same).
+fn canonical_hhmm(value: &str) -> Result<String, String> {
+    Ok(parse_hhmm(value)?.format("%H:%M").to_string())
 }
 
 fn now_for_config(config: &Config) -> Result<DateTime<chrono::FixedOffset>, String> {
@@ -801,7 +809,8 @@ impl WindowDraft {
     }
 
     fn to_cli_value(&self) -> Result<String, String> {
-        if self.start == self.end {
+        // Compare by parsed time so non-canonical equals (e.g. 9:00 / 09:00) are caught.
+        if parse_hhmm(&self.start)? == parse_hhmm(&self.end)? {
             return Err("Lock window start and end cannot be the same.".to_owned());
         }
         let days: Vec<&str> = DAYS
@@ -1385,9 +1394,8 @@ fn normalize_gui_viewport(ctx: &egui::Context) {
         620.0, 360.0,
     )));
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(760.0, height)));
-    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-        120.0, 60.0,
-    )));
+    // Do NOT force OuterPosition: that overrides eframe's `centered` placement and
+    // can push the window off-screen. Let the window stay where eframe centered it.
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
 }
 
@@ -1568,10 +1576,13 @@ fn unlock_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
         if let Some(status) = &app.status {
             ui.add_space(10.0);
             if let Some(value) = &status.locked_until {
-                meta_label(ui, format!("Scheduled lock ends: {value}"));
+                meta_label(ui, format!("Scheduled lock ends: {}", pretty_time(value)));
             }
             if let Some(value) = &status.unlock_expires_at {
-                meta_label(ui, format!("Temporary unlock expires: {value}"));
+                meta_label(
+                    ui,
+                    format!("Temporary unlock expires: {}", pretty_time(value)),
+                );
             }
         }
     });
@@ -1678,7 +1689,7 @@ fn labeled_duration(ui: &mut egui::Ui, label: &str, value: &mut i64) {
     ui.horizontal_wrapped(|ui| {
         ui.add(
             egui::DragValue::new(value)
-                .range(1..=1440)
+                .range(1..=MAX_UNLOCK_MINUTES)
                 .suffix(" min")
                 .speed(1),
         );
@@ -1929,11 +1940,18 @@ fn status_summary(ui: &mut egui::Ui, status: &StatusPayload) {
     ui.label(egui::RichText::new(label).size(18.0).strong().color(color));
     meta_label(ui, status.reason.as_str());
     if let Some(value) = &status.locked_until {
-        meta_label(ui, format!("Lock ends {value}"));
+        meta_label(ui, format!("Lock ends {}", pretty_time(value)));
     }
     if let Some(value) = &status.unlock_expires_at {
-        meta_label(ui, format!("Temporary unlock until {value}"));
+        meta_label(ui, format!("Temporary unlock until {}", pretty_time(value)));
     }
+}
+
+/// Format an RFC3339 timestamp as a friendly local-ish string; fall back to raw.
+fn pretty_time(rfc3339: &str) -> String {
+    DateTime::parse_from_rfc3339(rfc3339)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| rfc3339.to_owned())
 }
 
 fn protection_summary(ui: &mut egui::Ui, protection: &ProtectionStatus) {
@@ -2188,7 +2206,11 @@ fn default_config() -> Config {
 }
 
 fn app_dir() -> PathBuf {
-    if let Ok(value) = env::var("PROMPT_PAROLE_HOME") {
+    // Ignore an empty PROMPT_PAROLE_HOME (it would otherwise yield a relative,
+    // broken data dir); fall through to ~/.prompt-parole.
+    if let Ok(value) = env::var("PROMPT_PAROLE_HOME")
+        && !value.trim().is_empty()
+    {
         return PathBuf::from(value);
     }
     dirs::home_dir()
@@ -2393,6 +2415,8 @@ enum CommandKind {
     GuardAgent {
         #[arg(long, value_enum, default_value = "start")]
         action: GuardAgentAction,
+        #[arg(long)]
+        password_stdin: bool,
     },
     #[command(hide = true)]
     GuardWatchdog {
@@ -2618,13 +2642,19 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             }
             run_input_guard(core.clone(), poll_millis)
         }
-        CommandKind::GuardAgent { action } => {
+        CommandKind::GuardAgent {
+            action,
+            password_stdin,
+        } => {
             match action {
                 GuardAgentAction::Start => {
                     start_guard_agent(core)?;
                     println!("Input guard agent started.");
                 }
                 GuardAgentAction::Stop => {
+                    // Stopping the guard removes an enforcement layer, so gate it
+                    // like unlock/uninstall (the "disable" action).
+                    require_action_password(core, password_stdin, "disable")?;
                     stop_guard_agent(core)?;
                     println!("Input guard agent stopped.");
                 }
@@ -4817,10 +4847,19 @@ fn main() {
     let cli = Cli::parse();
     if let Some(command) = cli.command {
         let core = ParoleCore { app_dir: app_dir() };
-        match run_cli(command, &core) {
-            Ok(code) => std::process::exit(code),
-            Err(err) => {
+        // Catch a panic so a CLI command (especially the `hook`, which gates prompts)
+        // fails CLOSED with exit code 2 — a panic's default abort exits non-zero in a
+        // way the agent treats as "allow", silently disabling the curfew.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_cli(command, &core)));
+        match result {
+            Ok(Ok(code)) => std::process::exit(code),
+            Ok(Err(err)) => {
                 eprintln!("prompt-parole: {err}");
+                std::process::exit(2);
+            }
+            Err(_) => {
+                eprintln!("prompt-parole: internal error");
                 std::process::exit(2);
             }
         }
@@ -4883,6 +4922,29 @@ mod tests {
         assert_eq!(window.start, "19:00");
         assert_eq!(window.end, "05:00");
         assert_eq!(window.days, DAYS);
+    }
+
+    #[test]
+    fn windows_are_canonicalized_and_zero_length_rejected() {
+        // Non-canonical times are canonicalized to HH:MM...
+        let window = parse_window("9:00-5:30 mon").unwrap();
+        assert_eq!(window.start, "09:00");
+        assert_eq!(window.end, "05:30");
+        // ...and a time-equal pair that differs only as a string is rejected.
+        assert!(parse_window("9:00-09:00 mon").is_err());
+        let config = normalize_config(Config {
+            version: 1,
+            timezone: "local".to_owned(),
+            unlock_duration_minutes: 30,
+            password_required_for: vec!["unlock".to_owned()],
+            lock_windows: vec![LockWindow {
+                start: "9:00".to_owned(),
+                end: "09:00".to_owned(),
+                days: vec!["mon".to_owned()],
+            }],
+            log_prompt_text: false,
+        });
+        assert!(config.is_err());
     }
 
     #[test]
