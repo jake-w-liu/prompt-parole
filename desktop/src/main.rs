@@ -4330,7 +4330,7 @@ fn locate_real_agent_binary(target: &str, wrapper: &Path) -> Result<PathBuf, Str
     }
 
     for path in known_agent_paths(target) {
-        if path.exists() && path != wrapper {
+        if usable_agent_candidate(&path, Some(wrapper)) {
             return Ok(path);
         }
     }
@@ -4362,14 +4362,14 @@ fn resolve_agent_at_runtime(target: &str) -> Option<PathBuf> {
     if let Some(paths) = env::var_os("PATH") {
         for dir in env::split_paths(&paths) {
             let candidate = dir.join(target);
-            if candidate.is_file() && !is_prompt_parole_launcher(&candidate) {
+            if usable_agent_candidate(&candidate, None) {
                 return Some(candidate);
             }
         }
     }
     known_agent_paths(target)
         .into_iter()
-        .find(|path| path.is_file())
+        .find(|path| usable_agent_candidate(path, None))
 }
 
 fn first_real_agent_candidate<'a>(
@@ -4382,11 +4382,15 @@ fn first_real_agent_candidate<'a>(
             return None;
         }
         let path = PathBuf::from(clean);
-        if path == wrapper || is_prompt_parole_launcher(&path) {
-            return None;
-        }
-        path.exists().then_some(path)
+        usable_agent_candidate(&path, Some(wrapper)).then_some(path)
     })
+}
+
+fn usable_agent_candidate(path: &Path, wrapper: Option<&Path>) -> bool {
+    if wrapper.is_some_and(|wrapper| path == wrapper) {
+        return false;
+    }
+    path.is_file() && !is_prompt_parole_launcher(path)
 }
 
 fn write_launcher_script(
@@ -6084,6 +6088,7 @@ mod tests {
         let wrapper = dir.path().join("codex");
         let launcher = dir.path().join("launcher-codex");
         let real = dir.path().join("real-codex");
+        let directory = dir.path().join("directory-codex");
         write_launcher_script(
             &launcher,
             Path::new("/tmp/prompt-parole"),
@@ -6091,17 +6096,44 @@ mod tests {
             Path::new("/opt/homebrew/bin/codex"),
         )
         .unwrap();
+        fs::create_dir(&directory).unwrap();
         fs::write(&wrapper, "#!/bin/sh\n").unwrap();
         fs::write(&real, "#!/bin/sh\n").unwrap();
 
         let lines = [
             wrapper.to_string_lossy().to_string(),
             launcher.to_string_lossy().to_string(),
+            directory.to_string_lossy().to_string(),
             real.to_string_lossy().to_string(),
         ];
         let selected = first_real_agent_candidate(lines.iter().map(String::as_str), &wrapper);
 
         assert_eq!(selected, Some(real));
+    }
+
+    #[test]
+    fn usable_agent_candidate_rejects_wrappers_and_non_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("codex");
+        let launcher = dir.path().join("launcher-codex");
+        let directory = dir.path().join("codex-dir");
+        let real = dir.path().join("real-codex");
+
+        write_launcher_script(
+            &launcher,
+            Path::new("/tmp/prompt-parole"),
+            "codex",
+            Path::new("/opt/homebrew/bin/codex"),
+        )
+        .unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+        fs::write(&real, "#!/bin/sh\n").unwrap();
+
+        assert!(!usable_agent_candidate(&wrapper, Some(&wrapper)));
+        assert!(!usable_agent_candidate(&launcher, Some(&wrapper)));
+        assert!(!usable_agent_candidate(&directory, Some(&wrapper)));
+        assert!(usable_agent_candidate(&real, Some(&wrapper)));
     }
 
     #[test]
