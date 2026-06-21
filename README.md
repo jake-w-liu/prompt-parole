@@ -53,10 +53,14 @@ release binary above is the supported path.
 
 ## Desktop GUI
 
+![Prompt Parole desktop app](docs/screenshot.png)
+
 Prompt Parole includes a native Rust desktop app. It is not a browser page, so
 Google Password Manager and browser-generated-password prompts are not involved.
 The desktop app and CLI are the same Rust binary, which keeps the hook logic and
-password hashing in one place.
+password hashing in one place. The interface uses a restrained palette drawn
+entirely from [Nippon Colors](https://nipponcolors.com/) (Tokiwa, Shironeri,
+Gofun, Sumi, Asagi, Yamabuki, Enji, Seiji, Torinoko, Rikyū-nezumi).
 
 Build and run it from the checkout:
 

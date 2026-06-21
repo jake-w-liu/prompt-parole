@@ -255,8 +255,16 @@ impl ParoleCore {
         if duration_minutes <= 0 {
             return Err("Unlock duration must be positive.".to_owned());
         }
+        // Cap at one year so a huge value cannot overflow chrono's date math (which
+        // would otherwise panic).
+        const MAX_UNLOCK_MINUTES: i64 = 366 * 24 * 60;
+        if duration_minutes > MAX_UNLOCK_MINUTES {
+            return Err("Unlock duration must be at most one year.".to_owned());
+        }
         let config = self.load_config()?;
-        let expires = now_for_config(&config)? + Duration::minutes(duration_minutes);
+        let expires = now_for_config(&config)?
+            .checked_add_signed(Duration::minutes(duration_minutes))
+            .ok_or_else(|| "Unlock duration is out of range.".to_owned())?;
         let state = State {
             version: 1,
             unlock_expires_at: Some(expires.to_rfc3339()),
@@ -309,14 +317,16 @@ impl ParoleCore {
         if !self.is_configured() {
             return Ok(None);
         }
-        let agent = normalized_hook_agent(agent)?;
+        // An unknown agent name still follows the (global) curfew rather than
+        // erroring — an unrecognized --agent must not block prompts 24/7.
+        let normalized = normalized_hook_agent(agent).ok();
         let decision = self.decision()?;
         if decision.allowed {
             return Ok(None);
         }
         append_event(
             &self.events_path(),
-            serde_json::json!({"event": "prompt_blocked", "agent": agent}),
+            serde_json::json!({"event": "prompt_blocked", "agent": normalized.unwrap_or(agent)}),
         );
         let until = decision
             .locked_until
@@ -326,7 +336,7 @@ impl ParoleCore {
             "decision": "block",
             "reason": format!("Prompt Parole: curfew is active until {until}. You can inspect progress, but new prompts need `prompt-parole unlock`.")
         });
-        if agent == "claude-code" {
+        if normalized == Some("claude-code") {
             payload["suppressOriginalPrompt"] = serde_json::Value::Bool(true);
         }
         Ok(Some(payload))
@@ -964,7 +974,9 @@ impl PromptParoleApp {
         } else {
             None
         };
-        self.protection = protection_status();
+        // Protection status spawns `ps` and probes the login shell, which can block
+        // for up to a few seconds. Leave it at default here so the first frame paints
+        // instantly; the background refresher fills it in on its first pass.
     }
 
     fn apply_config_to_editors(&mut self, config: &Config) {
@@ -1124,12 +1136,14 @@ impl PromptParoleApp {
     fn setup(&mut self, ctx: &egui::Context) {
         if self.passwords.setup_first != self.passwords.setup_again {
             self.error = "Passwords do not match.".to_owned();
+            self.notice.clear();
             return;
         }
         let windows = match self.window_values() {
             Ok(values) => values,
             Err(err) => {
                 self.error = err;
+                self.notice.clear();
                 return;
             }
         };
@@ -1148,6 +1162,7 @@ impl PromptParoleApp {
             Ok(values) => values,
             Err(err) => {
                 self.error = err;
+                self.notice.clear();
                 return;
             }
         };
@@ -1173,6 +1188,7 @@ impl PromptParoleApp {
     fn change_password(&mut self, ctx: &egui::Context) {
         if self.passwords.new_first != self.passwords.new_again {
             self.error = "New passwords do not match.".to_owned();
+            self.notice.clear();
             return;
         }
         let current = self.passwords.change_current.clone();
@@ -2952,9 +2968,12 @@ fn current_window_is_target() -> bool {
     {
         return *value;
     }
+    let previous = guard.as_ref().map(|(_, value)| *value).unwrap_or(false);
+    // On a transient CGWindowList failure, reuse the last known value rather than
+    // flipping to "not a target" (which would briefly let keys through during curfew).
     let value = macos_front_window::frontmost_window()
         .map(|window| window_info_is_target(&window))
-        .unwrap_or(false);
+        .unwrap_or(previous);
     *guard = Some((Instant::now(), value));
     value
 }
@@ -3218,13 +3237,17 @@ fn stop_guard_agent(core: &ParoleCore) -> Result<(), String> {
         let domain = launchctl_domain()?;
         let guard_target = launchctl_target(&domain, GUARD_AGENT_LABEL);
         let watchdog_target = launchctl_target(&domain, GUARD_WATCHDOG_LABEL);
-        // Tear down the watchdog FIRST so it cannot resurrect the guard between
-        // when we kill the guard and when we would kill the watchdog. Both bootouts
-        // run regardless of either's error so a watchdog failure can't leave the
-        // guard agent loaded.
+        // Fully tear down the watchdog FIRST — unload its plist AND kill its process,
+        // then wait until it is actually gone — before booting out the guard. Both
+        // bootout and kill are asynchronous, so without the wait a still-running
+        // watchdog could re-bootstrap the KeepAlive guard right after we stop it.
         let watchdog_result = stop_launchctl_target(&watchdog_target);
-        let guard_result = stop_launchctl_target(&guard_target);
         stop_guard_watchdog_processes();
+        let deadline = Instant::now() + StdDuration::from_secs(3);
+        while guard_watchdog_running() && Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(100));
+        }
+        let guard_result = stop_launchctl_target(&guard_target);
         stop_guard_processes();
         watchdog_result.and(guard_result)
     }
@@ -3377,6 +3400,15 @@ fn launch_agent_plist(
         .map(|arg| format!("    <string>{}</string>", xml_escape(arg)))
         .collect::<Vec<_>>()
         .join("\n");
+    // Propagate a custom data dir to the launchd job, which otherwise would not
+    // inherit PROMPT_PAROLE_HOME and would read the wrong (default) config.
+    let env_xml = match env::var("PROMPT_PAROLE_HOME") {
+        Ok(home) if !home.is_empty() => format!(
+            "  <key>EnvironmentVariables</key>\n  <dict>\n    <key>PROMPT_PAROLE_HOME</key>\n    <string>{}</string>\n  </dict>\n",
+            xml_escape(&home)
+        ),
+        _ => String::new(),
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -3389,10 +3421,12 @@ fn launch_agent_plist(
     <string>{exe}</string>
 {arg_xml}
   </array>
-  <key>RunAtLoad</key>
+{env_xml}  <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
   <key>StandardOutPath</key>
   <string>{stdout}</string>
   <key>StandardErrorPath</key>
@@ -3403,6 +3437,7 @@ fn launch_agent_plist(
         label = xml_escape(label),
         exe = xml_escape(&exe.to_string_lossy()),
         arg_xml = arg_xml,
+        env_xml = env_xml,
         stdout = xml_escape(&stdout.to_string_lossy()),
         stderr = xml_escape(&stderr.to_string_lossy())
     )
@@ -3774,27 +3809,31 @@ mod macos_event_tap {
         event: CgEventRef,
         _user_info: *mut c_void,
     ) -> CgEventRef {
-        // If macOS disabled the tap, re-enable it immediately (do not wait for the
-        // run-loop timeout, which would leave the curfew unenforced for up to an hour).
-        if event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
-            || event_type == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
-        {
-            let port = TAP_PORT.load(Ordering::Acquire);
-            if !port.is_null() {
-                unsafe { CGEventTapEnable(port, true) };
+        // A panic must not unwind across this `extern "C"` boundary (that aborts the
+        // process). Contain it and, if anything goes wrong, pass the event through.
+        let block = std::panic::catch_unwind(|| {
+            if event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+                || event_type == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+            {
+                // macOS disabled the tap; re-enable it immediately rather than waiting
+                // for the run-loop timeout (which would leave the curfew unenforced).
+                let port = TAP_PORT.load(Ordering::Acquire);
+                if !port.is_null() {
+                    unsafe { CGEventTapEnable(port, true) };
+                }
+                return false;
             }
-            return event;
-        }
-        if event_type == K_CG_EVENT_KEY_DOWN && CURFEW_ACTIVE.load(Ordering::Relaxed) {
-            let key_code =
-                unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
-            let flags = unsafe { CGEventGetFlags(event) };
-            // Only pay for the live focus check on keys we would actually block.
-            if should_block_guard_key(key_code, flags) && current_window_is_target() {
-                return ptr::null_mut();
+            if event_type == K_CG_EVENT_KEY_DOWN && CURFEW_ACTIVE.load(Ordering::Relaxed) {
+                let key_code =
+                    unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
+                let flags = unsafe { CGEventGetFlags(event) };
+                // Only pay for the live focus check on keys we would actually block.
+                return should_block_guard_key(key_code, flags) && current_window_is_target();
             }
-        }
-        event
+            false
+        })
+        .unwrap_or(false);
+        if block { ptr::null_mut() } else { event }
     }
 
     pub fn run() -> Result<i32, String> {
@@ -3966,10 +4005,12 @@ fn install_launcher(target: &str, bin_dir: Option<&Path>) -> Result<LauncherInst
     let dir = launcher_bin_dir(bin_dir)?;
     fs::create_dir_all(&dir).map_err(|err| format!("Could not create {}: {err}", dir.display()))?;
     let wrapper = dir.join(target);
-    // If a non-launcher file already occupies the wrapper path, move it aside FIRST.
+    // If a non-launcher entry already occupies the wrapper path, move it aside FIRST.
     // That file is the user's real agent, so the wrapper must then point at the backup
-    // (not at the now-vacated wrapper path).
-    let backup = if wrapper.exists() && !is_prompt_parole_launcher(&wrapper) {
+    // (not at the now-vacated wrapper path). Use symlink_metadata so a dangling
+    // symlink is also moved aside, rather than being written *through* by fs::write.
+    let entry_exists = fs::symlink_metadata(&wrapper).is_ok();
+    let backup = if entry_exists && !is_prompt_parole_launcher(&wrapper) {
         let backup = unique_path(&wrapper.with_file_name(format!(
             "{}.prompt-parole.backup.{}",
             target,
@@ -4201,7 +4242,14 @@ fn install_macos_app_bundle(app_dir: Option<&Path>) -> Result<PathBuf, String> {
     let exe =
         env::current_exe().map_err(|err| format!("Could not locate current executable: {err}"))?;
     let bundled_exe = macos.join("prompt-parole");
-    let same_file = fs::canonicalize(&exe).ok() == fs::canonicalize(&bundled_exe).ok();
+    // Only "same file" if BOTH paths canonicalize successfully and match. Two
+    // canonicalize failures (e.g. bundled_exe doesn't exist yet on first install)
+    // must NOT be treated as equal, or the copy would be skipped and the bundle
+    // would have no executable.
+    let same_file = match (fs::canonicalize(&exe), fs::canonicalize(&bundled_exe)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
     if !same_file {
         // Copy to a temp file and rename into place (a fresh inode) rather than
         // overwriting the running binary's inode. Overwriting in place invalidates
@@ -4778,15 +4826,19 @@ mod tests {
 
     #[test]
     fn window_draft_builds_cli_value() {
-        let mut draft = WindowDraft::default();
-        draft.days = [true, true, false, false, false, false, false];
+        let draft = WindowDraft {
+            days: [true, true, false, false, false, false, false],
+            ..WindowDraft::default()
+        };
         assert_eq!(draft.to_cli_value().unwrap(), "19:00-05:00 mon,tue");
     }
 
     #[test]
     fn window_draft_rejects_no_days() {
-        let mut draft = WindowDraft::default();
-        draft.days = [false; 7];
+        let draft = WindowDraft {
+            days: [false; 7],
+            ..WindowDraft::default()
+        };
         assert!(
             draft
                 .to_cli_value()
@@ -4918,6 +4970,30 @@ mod tests {
         assert!(codex["reason"].as_str().unwrap().contains("curfew"));
         let claude = core.hook_payload("claude-code").unwrap().unwrap();
         assert_eq!(claude["suppressOriginalPrompt"], true);
+        // An unknown agent follows the curfew (blocks while locked) rather than
+        // erroring into a permanent 24/7 block, and carries no claude-only flag.
+        let unknown = core.hook_payload("bogus").unwrap().unwrap();
+        assert_eq!(unknown["decision"], "block");
+        assert!(unknown.get("suppressOriginalPrompt").is_none());
+    }
+
+    #[test]
+    fn unlock_rejects_absurd_duration_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = ParoleCore {
+            app_dir: dir.path().to_path_buf(),
+        };
+        core.setup(
+            "ok",
+            vec!["19:00-05:00 mon".to_owned()],
+            "local".to_owned(),
+            30,
+            vec!["unlock".to_owned()],
+        )
+        .unwrap();
+        assert!(core.unlock("ok", i64::MAX).is_err());
+        assert!(core.unlock("ok", 0).is_err());
+        assert!(core.unlock("ok", 30).is_ok());
     }
 
     #[test]
