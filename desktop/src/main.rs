@@ -1,5 +1,7 @@
 use base64::{Engine as _, engine::general_purpose};
-use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use clap::{Parser, Subcommand, ValueEnum};
 use constant_time_eq::constant_time_eq;
@@ -7,15 +9,16 @@ use eframe::egui;
 use rand::Rng;
 use scrypt::{Params as ScryptParams, scrypt};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 const DAYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 const PASSWORD_ACTIONS: [&str; 6] = [
@@ -138,10 +141,22 @@ impl ParoleCore {
 
     fn load_state(&self) -> State {
         let path = self.state_path();
-        if let Ok(raw) = fs::read_to_string(path)
-            && let Ok(state) = serde_json::from_str(&raw)
-        {
-            return state;
+        if let Ok(raw) = fs::read_to_string(&path) {
+            match serde_json::from_str(&raw) {
+                Ok(state) => return state,
+                Err(err) => {
+                    // A corrupt state file drops any active temporary unlock (it
+                    // re-locks, the safe direction). decision() runs in hot loops
+                    // (guard poll, GUI refresh), so warn only once per process.
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "prompt-parole: ignoring unreadable {} ({err}); treating as locked.",
+                            path.display()
+                        );
+                    }
+                }
+            }
         }
         State {
             version: 1,
@@ -289,10 +304,12 @@ impl ParoleCore {
     }
 
     fn hook_payload(&self, agent: &str) -> Result<Option<serde_json::Value>, String> {
-        let agent = normalized_hook_agent(agent)?;
+        // When unconfigured, allow regardless of the agent name (a typo'd --agent
+        // on an unconfigured machine must not block).
         if !self.is_configured() {
             return Ok(None);
         }
+        let agent = normalized_hook_agent(agent)?;
         let decision = self.decision()?;
         if decision.allowed {
             return Ok(None);
@@ -441,14 +458,33 @@ fn now_for_config(config: &Config) -> Result<DateTime<chrono::FixedOffset>, Stri
 }
 
 fn evaluate(config: &Config, state: &State) -> Result<Decision, String> {
-    let now = now_for_config(config)?;
-    let locked_until = scheduled_lock_until(config, now)?;
+    // Evaluate against the real time zone (not a frozen offset) so DST transitions
+    // inside a curfew window resolve each wall-clock boundary at its own offset.
+    if config.timezone == "local" {
+        evaluate_in_zone(config, state, Local::now())
+    } else {
+        let tz = config
+            .timezone
+            .parse::<Tz>()
+            .map_err(|_| format!("Unknown timezone {:?}.", config.timezone))?;
+        evaluate_in_zone(config, state, Utc::now().with_timezone(&tz))
+    }
+}
+
+fn evaluate_in_zone<Z: TimeZone>(
+    config: &Config,
+    state: &State,
+    now: DateTime<Z>,
+) -> Result<Decision, String> {
+    let locked_until = scheduled_lock_until(config, now.clone())?;
     let unlock_expires_at = state
         .unlock_expires_at
         .as_deref()
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok());
+    let now_utc = now.to_utc();
     let scheduled_locked = locked_until.is_some();
-    let temporarily_unlocked = unlock_expires_at.is_some_and(|value| now < value);
+    let temporarily_unlocked = unlock_expires_at.is_some_and(|value| now_utc < value.to_utc());
+    let locked_until = locked_until.map(|value| value.fixed_offset());
     if !scheduled_locked {
         return Ok(Decision {
             allowed: true,
@@ -479,11 +515,12 @@ fn evaluate(config: &Config, state: &State) -> Result<Decision, String> {
     })
 }
 
-fn scheduled_lock_until(
+fn scheduled_lock_until<Z: TimeZone>(
     config: &Config,
-    now: DateTime<chrono::FixedOffset>,
-) -> Result<Option<DateTime<chrono::FixedOffset>>, String> {
-    let mut matching = Vec::new();
+    now: DateTime<Z>,
+) -> Result<Option<DateTime<Z>>, String> {
+    let tz = now.timezone();
+    let mut matching: Vec<DateTime<Z>> = Vec::new();
     for window in &config.lock_windows {
         for offset in [-1, 0] {
             let start_date = now.date_naive() + Duration::days(offset);
@@ -498,22 +535,38 @@ fn scheduled_lock_until(
             if end_naive <= start_naive {
                 end_naive += Duration::days(1);
             }
-            let start_dt = now
-                .offset()
-                .from_local_datetime(&start_naive)
-                .single()
-                .ok_or_else(|| "Could not resolve lock start time.".to_owned())?;
-            let end_dt = now
-                .offset()
-                .from_local_datetime(&end_naive)
-                .single()
-                .ok_or_else(|| "Could not resolve lock end time.".to_owned())?;
+            // On an ambiguous (fall-back) hour, bias toward more locking: resolve
+            // the start to the earliest instant and the end to the latest, so the
+            // curfew can never lift early.
+            let start_dt = resolve_in_zone(&tz, start_naive, false);
+            let end_dt = resolve_in_zone(&tz, end_naive, true);
             if start_dt <= now && now < end_dt {
                 matching.push(end_dt);
             }
         }
     }
     Ok(matching.into_iter().max())
+}
+
+/// Convert a wall-clock time to an instant in `tz`, handling DST transitions. For
+/// an ambiguous fall-back hour, pick the later instant when `prefer_later` (curfew
+/// end) else the earlier (curfew start). Across a spring-forward gap (always <=1h),
+/// skip forward to the first valid instant.
+fn resolve_in_zone<Z: TimeZone>(tz: &Z, naive: NaiveDateTime, prefer_later: bool) -> DateTime<Z> {
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt,
+        LocalResult::Ambiguous(earliest, latest) => {
+            if prefer_later {
+                latest
+            } else {
+                earliest
+            }
+        }
+        LocalResult::None => tz
+            .from_local_datetime(&(naive + Duration::hours(1)))
+            .single()
+            .unwrap_or_else(|| tz.from_utc_datetime(&naive)),
+    }
 }
 
 fn validate_password(password: &str) -> Result<(), String> {
@@ -566,31 +619,83 @@ fn verify_password(password: &str, secret: &Secret) -> Result<bool, String> {
     let expected = general_purpose::STANDARD
         .decode(&secret.hash)
         .map_err(|err| format!("Invalid password hash: {err}"))?;
-    let params = ScryptParams::new(log_n, secret.params.r, secret.params.p, secret.params.dklen)
-        .map_err(|err| format!("Invalid scrypt params: {err}"))?;
-    let mut output = vec![0_u8; secret.params.dklen];
-    scrypt(password.as_bytes(), &salt, &params, &mut output)
-        .map_err(|err| format!("Could not verify password: {err}"))?;
+    // Derive to the stored hash's actual length, not the separate `dklen` field:
+    // scrypt() uses output.len(), so a corrupted dklen must not cause a length
+    // mismatch that rejects the correct password forever. A hash whose length
+    // scrypt won't accept (corrupt secret) is treated as a non-match, not an error,
+    // so it surfaces as "incorrect password" rather than a hard failure.
+    let Ok(params) = ScryptParams::new(log_n, secret.params.r, secret.params.p, expected.len())
+    else {
+        return Ok(false);
+    };
+    let mut output = vec![0_u8; expected.len()];
+    if scrypt(password.as_bytes(), &salt, &params, &mut output).is_err() {
+        return Ok(false);
+    }
     Ok(constant_time_eq(&output, &expected))
 }
 
 fn ensure_private_dir(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path)
-        .map_err(|err| format!("Could not create {}: {err}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        // Create the directory already restricted to the user (0700) so there is
+        // no window where the secrets directory is group/world-traversable.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|err| format!("Could not create {}: {err}", path.display()))?;
+        // If it already existed with wider permissions, tighten it now.
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|err| format!("Could not secure {}: {err}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+            .map_err(|err| format!("Could not create {}: {err}", path.display()))?;
     }
     Ok(())
 }
 
+/// Write app-owned secret/config/state durably and privately (dir 0700, file 0600).
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory.", path.display()))?;
     ensure_private_dir(parent)?;
+    persist_json_atomic(path, parent, value, Some(0o600))
+}
+
+/// Write into a config file we do not own (e.g. ~/.claude/settings.json) without
+/// tightening the directory or the file's existing permissions.
+fn write_json_shared<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory.", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+    let preserve = existing_file_mode(path);
+    persist_json_atomic(path, parent, value, preserve)
+}
+
+#[cfg(unix)]
+fn existing_file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).ok().map(|meta| meta.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn existing_file_mode(_path: &Path) -> Option<u32> {
+    None
+}
+
+fn persist_json_atomic<T: Serialize>(
+    path: &Path,
+    parent: &Path,
+    value: &T,
+    mode: Option<u32>,
+) -> Result<(), String> {
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|err| format!("Could not create temp file for {}: {err}", path.display()))?;
     serde_json::to_writer_pretty(&mut temp, value)
@@ -598,16 +703,35 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
     temp.write_all(b"\n")
         .map_err(|err| format!("Could not finish JSON: {err}"))?;
     #[cfg(unix)]
-    {
+    if let Some(mode) = mode {
         use std::os::unix::fs::PermissionsExt;
         temp.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|err| format!("Could not secure temp file: {err}"))?;
+            .set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|err| format!("Could not set permissions on temp file: {err}"))?;
     }
+    #[cfg(not(unix))]
+    let _ = mode;
+    // Flush file data to disk before the rename so a crash cannot leave the
+    // destination present but empty/partial.
+    temp.as_file()
+        .sync_all()
+        .map_err(|err| format!("Could not flush {}: {err}", path.display()))?;
     temp.persist(path)
         .map_err(|err| format!("Could not replace {}: {}", path.display(), err.error))?;
+    // Flush the rename itself so the new file is durably linked into the directory.
+    sync_dir(parent);
     Ok(())
 }
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) {
+    if let Ok(handle) = fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) {}
 
 fn append_event(path: &Path, payload: serde_json::Value) {
     if let Some(parent) = path.parent()
@@ -746,13 +870,33 @@ impl AppTab {
     }
 }
 
+/// Messages from background worker/refresher threads back to the UI thread.
+enum AppEvent {
+    /// Periodic live refresh of lock status and protection (never touches the
+    /// editable fields the user may be mid-edit on).
+    Refresh {
+        configured: bool,
+        status: Option<StatusPayload>,
+        protection: ProtectionStatus,
+    },
+    /// A user-triggered action finished.
+    ActionDone {
+        outcome: Result<String, String>,
+        configured: bool,
+        config: Config,
+        status: Option<StatusPayload>,
+        protection: ProtectionStatus,
+        reset_editors: bool,
+    },
+}
+
 struct PromptParoleApp {
     core: ParoleCore,
     app_dir: PathBuf,
     config: Config,
     configured: bool,
     status: Option<StatusPayload>,
-    status_line: String,
+    notice: String,
     error: String,
     passwords: PasswordFields,
     windows: Vec<WindowDraft>,
@@ -763,6 +907,11 @@ struct PromptParoleApp {
     generated_password: String,
     protection: ProtectionStatus,
     active_tab: AppTab,
+    busy: Option<String>,
+    events_tx: mpsc::Sender<AppEvent>,
+    events_rx: mpsc::Receiver<AppEvent>,
+    refresher_started: bool,
+    style_applied: bool,
     viewport_normalized: bool,
 }
 
@@ -772,13 +921,14 @@ impl PromptParoleApp {
         let core = ParoleCore {
             app_dir: app_dir.clone(),
         };
+        let (events_tx, events_rx) = mpsc::channel();
         let mut app = Self {
             core,
             app_dir,
             config: default_config(),
             configured: false,
             status: None,
-            status_line: "Loading status".to_owned(),
+            notice: String::new(),
             error: String::new(),
             passwords: PasswordFields::default(),
             windows: vec![WindowDraft::default()],
@@ -792,40 +942,186 @@ impl PromptParoleApp {
             generated_password: String::new(),
             protection: ProtectionStatus::default(),
             active_tab: initial_app_tab(),
+            busy: None,
+            events_tx,
+            events_rx,
+            refresher_started: false,
+            style_applied: false,
             viewport_normalized: false,
         };
         app.reload();
         app
     }
 
+    /// Full synchronous load — used once at startup. All later refreshes happen on
+    /// background threads so the UI never blocks.
     fn reload(&mut self) {
-        self.configured = self.app_dir.join("secret.json").exists();
-        self.config = self.core.load_config().unwrap_or_else(|_| default_config());
-        self.timezone = self.config.timezone.clone();
-        self.unlock_duration_minutes = self.config.unlock_duration_minutes;
-        self.unlock_request_minutes = self.config.unlock_duration_minutes;
-        self.password_actions = normalized_actions(&self.config.password_required_for);
-        self.windows = if self.config.lock_windows.is_empty() {
+        self.configured = self.core.is_configured();
+        let config = self.core.load_config().unwrap_or_else(|_| default_config());
+        self.apply_config_to_editors(&config);
+        self.status = if self.configured {
+            self.core.status().ok()
+        } else {
+            None
+        };
+        self.protection = protection_status();
+    }
+
+    fn apply_config_to_editors(&mut self, config: &Config) {
+        self.timezone = config.timezone.clone();
+        self.unlock_duration_minutes = config.unlock_duration_minutes;
+        self.unlock_request_minutes = config.unlock_duration_minutes;
+        self.password_actions = normalized_actions(&config.password_required_for);
+        self.windows = if config.lock_windows.is_empty() {
             vec![WindowDraft::default()]
         } else {
-            self.config
+            config
                 .lock_windows
                 .iter()
                 .map(WindowDraft::from_window)
                 .collect()
         };
-        self.status = self.core.status().ok();
-        self.protection = protection_status();
-        self.status_line = match (&self.status, self.configured) {
-            (_, false) => "Not configured".to_owned(),
-            (Some(status), _) if status.allowed => format!("Allowed: {}", status.reason),
-            (Some(status), _) => format!("Blocked: {}", status.reason),
-            (None, _) => "Configured; status unavailable".to_owned(),
+        self.config = config.clone();
+    }
+
+    fn clear_password_inputs(&mut self) {
+        self.passwords = PasswordFields::default();
+        self.generated_password.clear();
+    }
+
+    /// Cheap status-only refresh for the manual Refresh button (no process scan).
+    fn refresh_status_now(&mut self) {
+        self.configured = self.core.is_configured();
+        self.status = if self.configured {
+            self.core.status().ok()
+        } else {
+            None
         };
     }
 
-    fn setup(&mut self) {
+    /// Start the background refresher (once) and drain pending worker messages.
+    fn pump(&mut self, ctx: &egui::Context) {
+        if !self.refresher_started {
+            self.refresher_started = true;
+            let tx = self.events_tx.clone();
+            let core = self.core.clone();
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                loop {
+                    let configured = core.is_configured();
+                    let status = if configured { core.status().ok() } else { None };
+                    let protection = protection_status();
+                    if tx
+                        .send(AppEvent::Refresh {
+                            configured,
+                            status,
+                            protection,
+                        })
+                        .is_err()
+                    {
+                        break; // UI gone; stop the thread.
+                    }
+                    ctx.request_repaint();
+                    thread::sleep(StdDuration::from_millis(1500));
+                }
+            });
+        }
+        // Drain everything, then apply Refreshes before ActionDones so an action's
+        // fresh result always wins over a background Refresh that was computed
+        // before the action landed and merely arrived in the same batch.
+        let mut events: Vec<AppEvent> = Vec::new();
+        while let Ok(event) = self.events_rx.try_recv() {
+            events.push(event);
+        }
+        let has_action = events
+            .iter()
+            .any(|event| matches!(event, AppEvent::ActionDone { .. }));
+        events.sort_by_key(|event| matches!(event, AppEvent::ActionDone { .. }));
+        for event in events {
+            match event {
+                AppEvent::Refresh {
+                    configured,
+                    status,
+                    protection,
+                } => {
+                    // Skip background refreshes while an action is settling (or one
+                    // completed this batch) so they cannot clobber its fresh state.
+                    if self.busy.is_none() && !has_action {
+                        self.configured = configured;
+                        self.status = status;
+                        self.protection = protection;
+                    }
+                }
+                AppEvent::ActionDone {
+                    outcome,
+                    configured,
+                    config,
+                    status,
+                    protection,
+                    reset_editors,
+                } => {
+                    self.busy = None;
+                    self.configured = configured;
+                    self.status = status;
+                    self.protection = protection;
+                    match outcome {
+                        Ok(notice) => {
+                            self.notice = notice;
+                            self.error.clear();
+                            self.clear_password_inputs();
+                            if reset_editors {
+                                self.apply_config_to_editors(&config);
+                            } else {
+                                self.config = config;
+                            }
+                        }
+                        Err(err) => {
+                            self.error = err;
+                            self.notice.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run a (possibly slow) action on a worker thread. The UI stays responsive and
+    /// shows a busy indicator; the result arrives via [`AppEvent::ActionDone`].
+    fn spawn_action<F>(&mut self, ctx: &egui::Context, label: &str, reset_editors: bool, job: F)
+    where
+        F: FnOnce(&ParoleCore) -> Result<String, String> + Send + 'static,
+    {
+        if self.busy.is_some() {
+            return;
+        }
         self.error.clear();
+        self.notice.clear();
+        self.busy = Some(label.to_owned());
+        let core = self.core.clone();
+        let tx = self.events_tx.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            // Catch a panic in the job so the UI's busy flag always clears; a stuck
+            // busy flag would disable the whole window permanently.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&core)))
+                .unwrap_or_else(|_| Err("The operation failed unexpectedly.".to_owned()));
+            let configured = core.is_configured();
+            let config = core.load_config().unwrap_or_else(|_| default_config());
+            let status = if configured { core.status().ok() } else { None };
+            let protection = protection_status();
+            let _ = tx.send(AppEvent::ActionDone {
+                outcome,
+                configured,
+                config,
+                status,
+                protection,
+                reset_editors,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    fn setup(&mut self, ctx: &egui::Context) {
         if self.passwords.setup_first != self.passwords.setup_again {
             self.error = "Passwords do not match.".to_owned();
             return;
@@ -837,26 +1133,17 @@ impl PromptParoleApp {
                 return;
             }
         };
-        match self.core.setup(
-            &self.passwords.setup_first,
-            windows,
-            self.timezone.clone(),
-            self.unlock_duration_minutes,
-            self.password_actions.clone(),
-        ) {
-            Ok(_) => {
-                self.passwords.setup_first.clear();
-                self.passwords.setup_again.clear();
-                self.generated_password.clear();
-                self.reload();
-                self.status_line = "Prompt Parole is set up.".to_owned();
-            }
-            Err(err) => self.error = err,
-        }
+        let password = self.passwords.setup_first.clone();
+        let timezone = self.timezone.clone();
+        let duration = self.unlock_duration_minutes;
+        let actions = self.password_actions.clone();
+        self.spawn_action(ctx, "Setting up…", true, move |core| {
+            core.setup(&password, windows, timezone, duration, actions)
+                .map(|_| "Prompt Parole is ready.".to_owned())
+        });
     }
 
-    fn save_settings(&mut self) {
-        self.error.clear();
+    fn save_settings(&mut self, ctx: &egui::Context) {
         let windows = match self.window_values() {
             Ok(values) => values,
             Err(err) => {
@@ -864,126 +1151,65 @@ impl PromptParoleApp {
                 return;
             }
         };
-        match self.core.configure(
-            &self.passwords.settings_current,
-            windows,
-            self.timezone.clone(),
-            self.unlock_duration_minutes,
-            self.password_actions.clone(),
-        ) {
-            Ok(_) => {
-                self.passwords.settings_current.clear();
-                self.reload();
-                self.status_line = "Settings saved.".to_owned();
-            }
-            Err(err) => self.error = err,
-        }
+        let password = self.passwords.settings_current.clone();
+        let timezone = self.timezone.clone();
+        let duration = self.unlock_duration_minutes;
+        let actions = self.password_actions.clone();
+        self.spawn_action(ctx, "Saving settings…", true, move |core| {
+            core.configure(&password, windows, timezone, duration, actions)
+                .map(|_| "Settings saved.".to_owned())
+        });
     }
 
-    fn unlock(&mut self) {
-        self.error.clear();
-        match self
-            .core
-            .unlock(&self.passwords.unlock, self.unlock_request_minutes)
-        {
-            Ok(expires) => {
-                self.passwords.unlock.clear();
-                self.reload();
-                self.status_line = format!("Unlocked until {}.", expires.to_rfc3339());
-            }
-            Err(err) => self.error = err,
-        }
+    fn unlock(&mut self, ctx: &egui::Context) {
+        let password = self.passwords.unlock.clone();
+        let minutes = self.unlock_request_minutes;
+        self.spawn_action(ctx, "Unlocking…", false, move |core| {
+            core.unlock(&password, minutes)
+                .map(|expires| format!("Unlocked until {}.", expires.format("%H:%M")))
+        });
     }
 
-    fn change_password(&mut self) {
-        self.error.clear();
+    fn change_password(&mut self, ctx: &egui::Context) {
         if self.passwords.new_first != self.passwords.new_again {
-            self.error = "Passwords do not match.".to_owned();
+            self.error = "New passwords do not match.".to_owned();
             return;
         }
-        match self
-            .core
-            .change_password(&self.passwords.change_current, &self.passwords.new_first)
-        {
-            Ok(_) => {
-                self.passwords.change_current.clear();
-                self.passwords.new_first.clear();
-                self.passwords.new_again.clear();
-                self.generated_password.clear();
-                self.reload();
-                self.status_line = "Password changed.".to_owned();
-            }
-            Err(err) => self.error = err,
-        }
+        let current = self.passwords.change_current.clone();
+        let next = self.passwords.new_first.clone();
+        self.spawn_action(ctx, "Changing password…", false, move |core| {
+            core.change_password(&current, &next)
+                .map(|_| "Password changed.".to_owned())
+        });
     }
 
-    fn manual_lock(&mut self) {
-        self.error.clear();
-        match self.core.lock() {
-            Ok(_) => {
-                self.reload();
-                self.status_line = "Temporary unlock cleared.".to_owned();
-            }
-            Err(err) => self.error = err,
-        }
+    fn manual_lock(&mut self, ctx: &egui::Context) {
+        self.spawn_action(ctx, "Clearing unlock…", false, move |core| {
+            core.lock().map(|_| "Temporary unlock cleared.".to_owned())
+        });
     }
 
-    fn install_protection(&mut self) {
-        self.error.clear();
-        if let Err(err) = self.core.assert_password(&self.passwords.install_current) {
-            self.error = err;
-            return;
-        }
-        let mut installed = 0;
-        for target in ["claude", "codex"] {
-            let path = match target_path(target, None) {
-                Ok(path) => path,
-                Err(err) => {
-                    self.error = err;
-                    return;
-                }
-            };
-            let command = default_hook_command(&target_agent(target));
-            if let Err(err) = install_json_hook(&path, &command, "Checking Prompt Parole curfew") {
-                self.error = err;
-                return;
-            }
-            if let Err(err) = install_launcher(target, None) {
-                self.error = err;
-                return;
-            }
-            installed += 1;
-        }
-        self.passwords.install_current.clear();
-        self.status_line = format!("Installed hooks and launchers for {installed} tools.");
-        self.reload();
+    fn install_protection(&mut self, ctx: &egui::Context) {
+        let password = self.passwords.install_current.clone();
+        self.spawn_action(ctx, "Installing protection…", false, move |core| {
+            gui_install_protection(core, &password)
+        });
     }
 
-    fn start_input_guard(&mut self) {
-        self.error.clear();
-        match start_guard_agent(&self.core) {
-            Ok(()) => {
-                self.status_line = "Input guard started.".to_owned();
-                thread::sleep(StdDuration::from_millis(500));
-                self.reload();
-            }
-            Err(err) => {
-                self.error = format!("Could not start input guard: {err}");
-            }
-        }
+    fn start_input_guard(&mut self, ctx: &egui::Context) {
+        self.spawn_action(ctx, "Starting input guard…", false, move |core| {
+            start_guard_agent(core)
+                .map(|()| "Input guard started.".to_owned())
+                .map_err(|err| format!("Could not start input guard: {err}"))
+        });
     }
 
-    fn install_app_bundle(&mut self) {
-        self.error.clear();
-        match install_macos_app_bundle(None) {
-            Ok(path) => {
-                self.status_line = format!("Installed app at {}.", path.display());
-                self.reload();
-            }
-            Err(err) => {
-                self.error = format!("Could not install app: {err}");
-            }
-        }
+    fn install_app_bundle(&mut self, ctx: &egui::Context) {
+        self.spawn_action(ctx, "Installing app…", false, move |_core| {
+            install_macos_app_bundle(None)
+                .map(|path| format!("Installed app at {}.", path.display()))
+                .map_err(|err| format!("Could not install app: {err}"))
+        });
     }
 
     fn window_values(&self) -> Result<Vec<String>, String> {
@@ -1010,13 +1236,39 @@ impl PromptParoleApp {
     }
 }
 
+/// Install hooks + launchers, honoring the same password gate the CLI uses.
+fn gui_install_protection(core: &ParoleCore, password: &str) -> Result<String, String> {
+    if core.is_configured() {
+        let config = core.load_config()?;
+        if config.password_required_for.iter().any(|a| a == "install") {
+            core.assert_password(password)?;
+        }
+    }
+    let mut installed = 0;
+    for target in ["claude", "codex"] {
+        let path = target_path(target, None)?;
+        let command = default_hook_command(&target_agent(target));
+        install_json_hook(&path, &command, "Checking Prompt Parole curfew")?;
+        install_launcher(target, None)?;
+        installed += 1;
+    }
+    Ok(format!(
+        "Installed hooks and launchers for {installed} tools. Restart Codex/Claude to apply."
+    ))
+}
+
 impl eframe::App for PromptParoleApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        apply_style(ui.ctx());
+        if !self.style_applied {
+            apply_style(ui.ctx());
+            self.style_applied = true;
+        }
         if !self.viewport_normalized {
             normalize_gui_viewport(ui.ctx());
             self.viewport_normalized = true;
         }
+        self.pump(ui.ctx());
+
         egui::Frame::new()
             .fill(shironeri())
             .inner_margin(0)
@@ -1025,10 +1277,17 @@ impl eframe::App for PromptParoleApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         centered_page(ui, |ui| {
-                            app_header(ui, &self.status_line, self.configured);
-                            ui.add_space(18.0);
+                            app_header(ui, self.status.as_ref(), self.configured);
+                            ui.add_space(14.0);
+
+                            if let Some(label) = self.busy.clone() {
+                                busy_banner(ui, &label);
+                                ui.add_space(10.0);
+                            } else if !self.notice.is_empty() {
+                                notice_banner(ui, &self.notice);
+                                ui.add_space(10.0);
+                            }
                             if !self.error.is_empty() {
-                                ui.add_space(12.0);
                                 alert_frame().show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     ui.colored_label(
@@ -1036,18 +1295,65 @@ impl eframe::App for PromptParoleApp {
                                         egui::RichText::new(&self.error).strong().size(14.0),
                                     );
                                 });
+                                ui.add_space(10.0);
                             }
-                            ui.add_space(18.0);
+                            ui.add_space(6.0);
 
-                            if self.configured {
-                                self.configured_ui(ui);
-                            } else {
-                                self.setup_ui(ui);
-                            }
+                            // Disable interaction (but keep everything visible) while
+                            // a background action is running.
+                            let enabled = self.busy.is_none();
+                            ui.scope(|ui| {
+                                if !enabled {
+                                    ui.disable();
+                                }
+                                if self.configured {
+                                    self.configured_ui(ui);
+                                } else {
+                                    self.setup_ui(ui);
+                                }
+                            });
                         });
                     });
             });
     }
+}
+
+fn busy_banner(ui: &mut egui::Ui, label: &str) {
+    egui::Frame::new()
+        .fill(field())
+        .stroke(egui::Stroke::new(1.0, asagi()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(16.0).color(aomidori()));
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(label)
+                        .color(aomidori())
+                        .strong()
+                        .size(14.0),
+                );
+            });
+        });
+}
+
+fn notice_banner(ui: &mut egui::Ui, notice: &str) {
+    egui::Frame::new()
+        .fill(field())
+        .stroke(egui::Stroke::new(1.0, seiji()))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(notice)
+                    .color(aomidori())
+                    .strong()
+                    .size(13.5),
+            );
+        });
 }
 
 fn normalize_gui_viewport(ctx: &egui::Context) {
@@ -1141,14 +1447,15 @@ fn setup_password_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
     section_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         section_title(ui, "First Setup");
-        vertical_password_editor(ui, "Password", &mut app.passwords.setup_first);
+        let first = vertical_password_editor(ui, "Password", &mut app.passwords.setup_first);
         ui.add_space(8.0);
-        vertical_password_editor(ui, "Password again", &mut app.passwords.setup_again);
+        let again = vertical_password_editor(ui, "Password again", &mut app.passwords.setup_again);
         ui.add_space(12.0);
         password_suggestion(ui, app);
         ui.add_space(16.0);
-        if full_primary_button(ui, "Start Parole").clicked() {
-            app.setup();
+        let enter = submitted_with_enter(ui, &first) || submitted_with_enter(ui, &again);
+        if full_primary_button(ui, "Start Parole").clicked() || enter {
+            app.setup(ui.ctx());
         }
     });
 }
@@ -1167,12 +1474,23 @@ fn overview_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 if secondary_button(ui, "Refresh").clicked() {
-                    app.reload();
+                    app.refresh_status_now();
                 }
                 if primary_button(ui, "Start Input Guard").clicked() {
-                    app.start_input_guard();
+                    app.start_input_guard(ui.ctx());
                 }
             });
+        });
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if compact_secondary_button(ui, "Permission Settings").clicked() {
+                open_input_monitoring_settings();
+            }
+            ui.add_space(6.0);
+            meta_label(
+                ui,
+                "Runs as the app — no Terminal. Needs Input Monitoring permission to block keys.",
+            );
         });
     });
 }
@@ -1197,14 +1515,15 @@ fn schedule_settings_card(ui: &mut egui::Ui, app: &mut PromptParoleApp, setup: b
         );
         if !setup {
             ui.add_space(16.0);
-            vertical_password_editor(
+            let password = vertical_password_editor(
                 ui,
                 "Password for settings",
                 &mut app.passwords.settings_current,
             );
             ui.add_space(10.0);
-            if full_primary_button(ui, "Save Settings").clicked() {
-                app.save_settings();
+            let enter = submitted_with_enter(ui, &password);
+            if full_primary_button(ui, "Save Settings").clicked() || enter {
+                app.save_settings(ui.ctx());
             }
         }
     });
@@ -1214,12 +1533,13 @@ fn unlock_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
     section_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         section_title(ui, "Temporary Unlock");
-        vertical_password_editor(ui, "Password", &mut app.passwords.unlock);
+        let password = vertical_password_editor(ui, "Password", &mut app.passwords.unlock);
         ui.add_space(8.0);
-        labeled_drag_value(ui, "Duration", &mut app.unlock_request_minutes);
+        labeled_duration(ui, "Duration", &mut app.unlock_request_minutes);
         ui.add_space(14.0);
-        if full_primary_button(ui, "Unlock Temporarily").clicked() {
-            app.unlock();
+        let enter = submitted_with_enter(ui, &password);
+        if full_primary_button(ui, "Unlock Temporarily").clicked() || enter {
+            app.unlock(ui.ctx());
         }
         if let Some(status) = &app.status {
             ui.add_space(10.0);
@@ -1237,16 +1557,20 @@ fn password_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
     section_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         section_title(ui, "Password");
-        vertical_password_editor(ui, "Current password", &mut app.passwords.change_current);
+        let current =
+            vertical_password_editor(ui, "Current password", &mut app.passwords.change_current);
         ui.add_space(8.0);
-        vertical_password_editor(ui, "New password", &mut app.passwords.new_first);
+        let next = vertical_password_editor(ui, "New password", &mut app.passwords.new_first);
         ui.add_space(8.0);
-        vertical_password_editor(ui, "New password again", &mut app.passwords.new_again);
+        let again = vertical_password_editor(ui, "New password again", &mut app.passwords.new_again);
         ui.add_space(12.0);
         password_suggestion(ui, app);
         ui.add_space(10.0);
-        if full_primary_button(ui, "Change Password").clicked() {
-            app.change_password();
+        let enter = submitted_with_enter(ui, &current)
+            || submitted_with_enter(ui, &next)
+            || submitted_with_enter(ui, &again);
+        if full_primary_button(ui, "Change Password").clicked() || enter {
+            app.change_password(ui.ctx());
         }
     });
 }
@@ -1256,7 +1580,7 @@ fn manual_lock_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
         ui.set_width(ui.available_width());
         section_title(ui, "Manual Lock");
         if full_secondary_button(ui, "Clear Temporary Unlock").clicked() {
-            app.manual_lock();
+            app.manual_lock(ui.ctx());
         }
     });
 }
@@ -1267,19 +1591,24 @@ fn protection_card(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
         section_title(ui, "Protection");
         protection_summary(ui, &app.protection);
         ui.add_space(12.0);
-        vertical_password_editor(
+        let password = vertical_password_editor(
             ui,
             "Password for install",
             &mut app.passwords.install_current,
         );
         ui.add_space(10.0);
-        if full_secondary_button(ui, "Install Hooks & Launchers").clicked() {
-            app.install_protection();
+        let enter = submitted_with_enter(ui, &password);
+        if full_secondary_button(ui, "Install Hooks & Launchers").clicked() || enter {
+            app.install_protection(ui.ctx());
         }
         meta_label(ui, "Protect future Codex and Claude sessions.");
+        meta_label(
+            ui,
+            "Codex enforces via the launcher; its prompt hook also needs to be trusted inside Codex.",
+        );
         ui.add_space(8.0);
         if full_secondary_button(ui, "Install Mac App").clicked() {
-            app.install_app_bundle();
+            app.install_app_bundle(ui.ctx());
         }
         meta_label(ui, "Add Prompt Parole to your Applications folder.");
     });
@@ -1303,23 +1632,53 @@ fn centered_page(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
-fn vertical_password_editor(ui: &mut egui::Ui, label: &str, value: &mut String) {
+/// True if the user pressed Enter while this field had focus (login-form muscle
+/// memory: type a password, hit Enter to submit).
+fn submitted_with_enter(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+}
+
+fn vertical_password_editor(ui: &mut egui::Ui, label: &str, value: &mut String) -> egui::Response {
     field_label(ui, label);
     ui.add(
         egui::TextEdit::singleline(value)
             .password(true)
             .desired_width(ui.available_width()),
-    );
+    )
 }
 
-fn labeled_drag_value(ui: &mut egui::Ui, label: &str, value: &mut i64) {
+/// A minutes field with quick presets. Clearer than a bare DragValue, which users
+/// often do not realize is editable.
+fn labeled_duration(ui: &mut egui::Ui, label: &str, value: &mut i64) {
     field_label(ui, label);
-    ui.add(
-        egui::DragValue::new(value)
-            .range(1..=1440)
-            .suffix(" min")
-            .speed(5),
-    );
+    ui.horizontal_wrapped(|ui| {
+        ui.add(
+            egui::DragValue::new(value)
+                .range(1..=1440)
+                .suffix(" min")
+                .speed(1),
+        );
+        ui.add_space(6.0);
+        for (caption, minutes) in [("15m", 15), ("30m", 30), ("1h", 60), ("2h", 120)] {
+            let selected = *value == minutes;
+            let fill = if selected {
+                aomidori()
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            let text_color = if selected { button_fg() } else { aomidori() };
+            let response = ui.add(
+                egui::Button::new(egui::RichText::new(caption).size(12.5).color(text_color))
+                    .fill(fill)
+                    .stroke(egui::Stroke::new(1.0, aomidori()))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .min_size(egui::vec2(40.0, 26.0)),
+            );
+            if response.clicked() {
+                *value = minutes;
+            }
+        }
+    });
 }
 
 fn field_label(ui: &mut egui::Ui, label: &str) {
@@ -1437,17 +1796,12 @@ fn settings_editor(
 
     ui.add_space(18.0);
     subsection_title(ui, "General");
-    ui.horizontal_wrapped(|ui| {
-        ui.vertical(|ui| {
-            ui.set_width(220.0);
-            field_label(ui, "Timezone");
-            ui.add(egui::TextEdit::singleline(timezone).desired_width(200.0));
-        });
+    ui.vertical(|ui| {
+        ui.set_width(ui.available_width());
+        field_label(ui, "Timezone");
+        ui.add(egui::TextEdit::singleline(timezone).desired_width(220.0));
         ui.add_space(10.0);
-        ui.vertical(|ui| {
-            ui.set_width(180.0);
-            labeled_drag_value(ui, "Default unlock", unlock_duration_minutes);
-        });
+        labeled_duration(ui, "Default unlock", unlock_duration_minutes);
     });
     ui.add_space(14.0);
     subsection_title(ui, "Password Gates");
@@ -1494,7 +1848,7 @@ fn password_suggestion(ui: &mut egui::Ui, app: &mut PromptParoleApp) {
     );
 }
 
-fn app_header(ui: &mut egui::Ui, status: &str, configured: bool) {
+fn app_header(ui: &mut egui::Ui, status: Option<&StatusPayload>, configured: bool) {
     ui.horizontal(|ui| {
         ui.heading(
             egui::RichText::new("Prompt Parole")
@@ -1508,6 +1862,18 @@ fn app_header(ui: &mut egui::Ui, status: &str, configured: bool) {
     });
     ui.add_space(10.0);
     palette_strip(ui);
+}
+
+/// (text, background, foreground) for the live status pill.
+fn pill_style(status: Option<&StatusPayload>, configured: bool) -> (&'static str, egui::Color32, egui::Color32) {
+    if !configured {
+        return ("Not configured", yamabuki(), sumi());
+    }
+    match status {
+        Some(status) if status.allowed => ("Prompts allowed", aomidori(), button_fg()),
+        Some(_) => ("Prompts blocked", enji(), button_fg()),
+        None => ("Status unavailable", rikyunezumi(), button_fg()),
+    }
 }
 
 fn palette_strip(ui: &mut egui::Ui) {
@@ -1532,16 +1898,15 @@ fn palette_strip(ui: &mut egui::Ui) {
     }
 }
 
-fn status_pill(ui: &mut egui::Ui, status: &str, configured: bool) {
-    let fill = if configured { aomidori() } else { yamabuki() };
-    let text_color = if configured { button_fg() } else { sumi() };
+fn status_pill(ui: &mut egui::Ui, status: Option<&StatusPayload>, configured: bool) {
+    let (text, fill, text_color) = pill_style(status, configured);
     egui::Frame::new()
         .fill(fill)
         .corner_radius(egui::CornerRadius::same(16))
         .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
             ui.label(
-                egui::RichText::new(status)
+                egui::RichText::new(text)
                     .color(text_color)
                     .strong()
                     .size(13.5),
@@ -2065,17 +2430,26 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             unlock_duration_minutes,
             password_required_for,
         } => {
+            // Fail on an already-configured machine or bad arguments BEFORE asking
+            // for a password, so the user does not type one only to be rejected.
+            if core.is_configured() {
+                return Err(
+                    "Prompt Parole is already configured. Use passwd to change the password."
+                        .to_owned(),
+                );
+            }
+            let actions = action_list(password_required_for);
+            config_from_parts(
+                lock_window.clone(),
+                timezone.clone(),
+                unlock_duration_minutes,
+                actions.clone(),
+            )?;
             let (first, second) = read_new_password(password_stdin)?;
             if first != second {
                 return Err("Passwords do not match.".to_owned());
             }
-            core.setup(
-                &first,
-                lock_window,
-                timezone,
-                unlock_duration_minutes,
-                action_list(password_required_for),
-            )?;
+            core.setup(&first, lock_window, timezone, unlock_duration_minutes, actions)?;
             println!("Prompt Parole is set up.");
             Ok(0)
         }
@@ -2086,7 +2460,6 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             unlock_duration_minutes,
             password_required_for,
         } => {
-            let current = read_current_password(password_stdin, "Current password: ")?;
             let existing = core.load_config()?;
             let windows = if lock_window.is_empty() {
                 existing
@@ -2097,15 +2470,22 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             } else {
                 lock_window
             };
-            let config = core.configure(
-                &current,
-                windows,
-                timezone.unwrap_or(existing.timezone),
-                unlock_duration_minutes.unwrap_or(existing.unlock_duration_minutes),
-                password_required_for
-                    .map(|value| action_list(Some(value)))
-                    .unwrap_or(existing.password_required_for),
+            let timezone = timezone.unwrap_or(existing.timezone);
+            let unlock_duration_minutes =
+                unlock_duration_minutes.unwrap_or(existing.unlock_duration_minutes);
+            let actions = password_required_for
+                .map(|value| action_list(Some(value)))
+                .unwrap_or(existing.password_required_for);
+            // Validate the merged config before prompting for the password.
+            config_from_parts(
+                windows.clone(),
+                timezone.clone(),
+                unlock_duration_minutes,
+                actions.clone(),
             )?;
+            let current = read_current_password(password_stdin, "Current password: ")?;
+            let config =
+                core.configure(&current, windows, timezone, unlock_duration_minutes, actions)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&config).map_err(|err| err.to_string())?
@@ -2421,27 +2801,31 @@ fn require_action_password(core: &ParoleCore, stdin: bool, action: &str) -> Resu
 }
 
 fn parse_targets(raw: &str) -> Result<Vec<String>, String> {
-    let targets = raw
-        .split(',')
-        .filter_map(|part| {
-            let clean = part.trim().to_lowercase();
-            (!clean.is_empty()).then_some(clean)
-        })
-        .collect::<Vec<_>>();
+    let mut targets: Vec<String> = Vec::new();
+    for part in raw.split(',') {
+        let clean = part.trim().to_lowercase();
+        if clean.is_empty() {
+            continue;
+        }
+        if clean != "claude" && clean != "codex" {
+            return Err(format!("Unknown target {clean:?}; expected claude or codex."));
+        }
+        // Dedup so repeated targets do not double-process the same config (and so
+        // a second pass cannot trip over the first pass's own changes).
+        if !targets.contains(&clean) {
+            targets.push(clean);
+        }
+    }
     if targets.is_empty() {
         return Err("At least one target is required.".to_owned());
-    }
-    for target in &targets {
-        if target != "claude" && target != "codex" {
-            return Err(format!(
-                "Unknown target {target:?}; expected claude or codex."
-            ));
-        }
     }
     Ok(targets)
 }
 
-static INPUT_BLOCKED: AtomicBool = AtomicBool::new(false);
+/// Whether a curfew is currently active (slow-changing; refreshed by the guard's
+/// poll thread). The focused-window check is done live in the event-tap callback,
+/// so this only needs minute-granularity accuracy.
+static CURFEW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 const GUARD_FLAG_CONTROL: u64 = 1 << 18;
 const GUARD_FLAG_OPTION: u64 = 1 << 19;
@@ -2452,6 +2836,10 @@ const GUARD_KEY_M: i64 = 46;
 const GUARD_KEY_RETURN: i64 = 36;
 const GUARD_KEY_ENTER: i64 = 76;
 
+// ponytail: keyboard-only guard. A keyboard event tap cannot see mouse "Edit >
+// Paste", drag-and-drop text, or Dictation, so those remain possible during
+// curfew. This matches the documented threat model (stop a habit, not defeat the
+// machine owner); closing them would require an accessibility/pasteboard observer.
 fn should_block_guard_key(key_code: i64, flags: u64) -> bool {
     if key_code == GUARD_KEY_RETURN || key_code == GUARD_KEY_ENTER {
         return true;
@@ -2517,27 +2905,141 @@ fn input_guard_status(core: &ParoleCore) -> Result<GuardStatus, String> {
     })
 }
 
+fn guard_curfew_active(core: &ParoleCore) -> bool {
+    // Fail CLOSED: if configured but the decision can't be computed (e.g. unreadable
+    // config), treat the curfew as active — the same safe re-lock direction
+    // load_state() takes on corruption.
+    core.is_configured()
+        && core
+            .decision()
+            .map(|decision| !decision.allowed)
+            .unwrap_or(true)
+}
+
 fn run_input_guard(core: ParoleCore, poll_millis: u64) -> Result<i32, String> {
     if poll_millis < 50 {
         return Err("poll-millis must be at least 50.".to_owned());
     }
     println!("Prompt Parole input guard is running.");
     println!("Output remains visible; keyboard input to locked Codex/Claude windows is blocked.");
-    let initial_blocking = input_guard_status(&core)
-        .map(|status| status.blocking_input)
-        .unwrap_or(false);
-    INPUT_BLOCKED.store(initial_blocking, Ordering::Relaxed);
+    // The poll thread tracks only the (slow-changing) curfew state; whether the
+    // focused window is a prompt target is re-checked live per keystroke in the
+    // event-tap callback, so a fast focus switch cannot slip a prompt through.
+    CURFEW_ACTIVE.store(guard_curfew_active(&core), Ordering::Relaxed);
     let poll_core = core.clone();
     thread::spawn(move || {
         loop {
-            let blocking = input_guard_status(&poll_core)
-                .map(|status| status.blocking_input)
-                .unwrap_or(false);
-            INPUT_BLOCKED.store(blocking, Ordering::Relaxed);
+            CURFEW_ACTIVE.store(guard_curfew_active(&poll_core), Ordering::Relaxed);
             thread::sleep(StdDuration::from_millis(poll_millis));
         }
     });
     platform_run_input_guard()
+}
+
+/// True if the currently focused window belongs to a Codex/Claude prompt target.
+/// Result is cached briefly: the event-tap callback calls this per blockable
+/// keystroke, and frontmost_window() (CGWindowList) is comparatively expensive.
+/// The short TTL keeps the focus-switch race tiny without per-key overhead.
+#[cfg(target_os = "macos")]
+fn current_window_is_target() -> bool {
+    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    let mut guard = match CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((stamp, value)) = guard.as_ref()
+        && stamp.elapsed() < StdDuration::from_millis(120)
+    {
+        return *value;
+    }
+    let value = macos_front_window::frontmost_window()
+        .map(|window| window_info_is_target(&window))
+        .unwrap_or(false);
+    *guard = Some((Instant::now(), value));
+    value
+}
+
+#[cfg(target_os = "macos")]
+fn window_info_is_target(window: &macos_front_window::WindowInfo) -> bool {
+    if window_is_agent_target(&window.owner, &window.title) {
+        return true;
+    }
+    // Process-tree fallback ONLY for terminal emulators, where the whole window is
+    // the terminal. We deliberately do NOT apply it to editors/IDEs (e.g. VS Code):
+    // there the agent runs in an embedded terminal but blocking the window would
+    // also block the editor, breaking the "you can still read/edit" promise.
+    is_terminal_owner(&window.owner) && window.pid > 0 && pid_tree_runs_agent(window.pid)
+}
+
+#[cfg(target_os = "macos")]
+fn is_terminal_owner(owner: &str) -> bool {
+    TERMINAL_OWNERS.contains(&owner.to_ascii_lowercase().as_str())
+}
+
+/// Whether `pid` or any descendant is a Codex/Claude process. The full process
+/// snapshot is cached briefly so the per-keystroke live check does not spawn `ps`
+/// on every key.
+/// (pid, ppid, executable-path) rows from `ps`.
+#[cfg(target_os = "macos")]
+type ProcRows = Vec<(i32, i32, String)>;
+
+#[cfg(target_os = "macos")]
+fn pid_tree_runs_agent(pid: i32) -> bool {
+    static CACHE: Mutex<Option<(Instant, ProcRows)>> = Mutex::new(None);
+    let mut guard = match CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let stale = guard
+        .as_ref()
+        .map(|(stamp, _)| stamp.elapsed() >= StdDuration::from_millis(300))
+        .unwrap_or(true);
+    if stale {
+        *guard = Some((Instant::now(), read_process_rows()));
+    }
+    guard
+        .as_ref()
+        .map(|(_, rows)| tree_has_agent(rows, pid))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn read_process_rows() -> Vec<(i32, i32, String)> {
+    let Ok(output) = Command::new("ps")
+        .args(["-axww", "-o", "pid=,ppid=,comm="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_proc_row)
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn parse_proc_row(line: &str) -> Option<(i32, i32, String)> {
+    // `ps` pads columns with runs of spaces. split_whitespace() collapses those so
+    // the numeric fields parse; the comm path (which may contain spaces) is then
+    // recovered as the positional remainder after the first two fields.
+    let trimmed = line.trim_start();
+    let mut fields = trimmed.split_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    let ppid = fields.next()?.parse().ok()?;
+    let after_pid = trimmed
+        .trim_start_matches(|c: char| !c.is_whitespace())
+        .trim_start();
+    let comm = after_pid
+        .trim_start_matches(|c: char| !c.is_whitespace())
+        .trim_start()
+        .to_owned();
+    if comm.is_empty() {
+        return None;
+    }
+    Some((pid, ppid, comm))
 }
 
 #[derive(Clone, Debug)]
@@ -2574,31 +3076,26 @@ fn start_guard_agent(core: &ParoleCore) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn start_guard_once(core: &ParoleCore) -> Result<(), String> {
-    {
-        let plist = guard_agent_plist_path()?;
-        write_guard_agent_plist(core, &plist)?;
-        let domain = launchctl_domain()?;
-        let target = launchctl_target(&domain, GUARD_AGENT_LABEL);
+    // Run the guard headlessly via launchd. We never open a Terminal window: if the
+    // event tap can't be created it's almost always a missing permission, and a
+    // surprise Terminal is worse than a clear instruction to grant it.
+    let plist = guard_agent_plist_path()?;
+    write_guard_agent_plist(core, &plist)?;
+    let domain = launchctl_domain()?;
+    let target = launchctl_target(&domain, GUARD_AGENT_LABEL);
+    reload_launch_agent(&domain, &target, &plist)?;
+    run_launchctl(&["kickstart", "-k", &target])?;
+    thread::sleep(StdDuration::from_millis(900));
+    if input_guard_running() {
+        Ok(())
+    } else {
+        // Tear the agent back down so launchd does not respawn a permission-less
+        // guard every ~10s (KeepAlive) until the user grants permission.
         let _ = run_launchctl(&["bootout", &target]);
-        match run_launchctl(&["bootstrap", &domain, plist.to_string_lossy().as_ref()])
-            .and_then(|_| run_launchctl(&["kickstart", "-k", &target]))
-        {
-            Ok(()) => {
-                thread::sleep(StdDuration::from_millis(900));
-                if input_guard_running() {
-                    return Ok(());
-                }
-            }
-            Err(err) => {
-                eprintln!("prompt-parole: direct launchd guard unavailable: {err}");
-                thread::sleep(StdDuration::from_millis(900));
-                if input_guard_running() {
-                    return Ok(());
-                }
-            }
-        }
-        let _ = run_launchctl(&["bootout", &target]);
-        start_terminal_guard()
+        Err("Input guard did not stay running. Grant Prompt Parole permission under \
+             System Settings > Privacy & Security > Input Monitoring (and Accessibility), \
+             then start it again."
+            .to_owned())
     }
 }
 
@@ -2617,8 +3114,7 @@ fn start_guard_watchdog_agent(core: &ParoleCore) -> Result<(), String> {
     write_guard_watchdog_plist(core, &plist)?;
     let domain = launchctl_domain()?;
     let target = launchctl_target(&domain, GUARD_WATCHDOG_LABEL);
-    let _ = run_launchctl(&["bootout", &target]);
-    run_launchctl(&["bootstrap", &domain, plist.to_string_lossy().as_ref()])?;
+    reload_launch_agent(&domain, &target, &plist)?;
     run_launchctl(&["kickstart", "-k", &target])?;
     thread::sleep(StdDuration::from_millis(600));
     if guard_watchdog_running() {
@@ -2628,71 +3124,91 @@ fn start_guard_watchdog_agent(core: &ParoleCore) -> Result<(), String> {
     }
 }
 
+/// Re-load a LaunchAgent. `bootout` is asynchronous, so an immediate `bootstrap`
+/// can fail with "service already loaded"; wait briefly and retry once.
+#[cfg(target_os = "macos")]
+fn reload_launch_agent(domain: &str, target: &str, plist: &Path) -> Result<(), String> {
+    let plist = plist.to_string_lossy();
+    let _ = run_launchctl(&["bootout", target]);
+    thread::sleep(StdDuration::from_millis(200));
+    if let Err(err) = run_launchctl(&["bootstrap", domain, plist.as_ref()]) {
+        thread::sleep(StdDuration::from_millis(400));
+        let _ = run_launchctl(&["bootout", target]);
+        thread::sleep(StdDuration::from_millis(200));
+        return run_launchctl(&["bootstrap", domain, plist.as_ref()]).map_err(|_| err);
+    }
+    Ok(())
+}
+
 fn guard_watchdog_running() -> bool {
     !prompt_parole_process_pids("guard-watchdog").is_empty()
 }
+
+const WATCHDOG_MAX_ATTEMPTS: u32 = 3;
+const WATCHDOG_BACKOFF: StdDuration = StdDuration::from_secs(300);
 
 fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, String> {
     if interval_seconds == 0 {
         return Err("interval-seconds must be positive.".to_owned());
     }
     println!("Prompt Parole guard watchdog is running.");
+    let mut failures: u32 = 0;
+    let mut backoff_until: Option<Instant> = None;
     loop {
-        let locked = core
-            .is_configured()
-            .then(|| core.decision().map(|decision| !decision.allowed))
-            .transpose()?
-            .unwrap_or(false);
-        if locked
-            && !input_guard_running()
-            && let Err(err) = recover_guard_from_watchdog(&core)
-        {
-            eprintln!("prompt-parole watchdog: could not start input guard: {err}");
+        let locked = guard_curfew_active(&core);
+        if !locked {
+            // Outside curfew there is nothing to recover; reset the backoff state.
+            failures = 0;
+            backoff_until = None;
+        } else if !input_guard_running() {
+            let backing_off = backoff_until.is_some_and(|until| Instant::now() < until);
+            if !backing_off {
+                match recover_guard_from_watchdog(&core) {
+                    Ok(()) => {
+                        failures = 0;
+                        backoff_until = None;
+                    }
+                    Err(err) => {
+                        failures += 1;
+                        eprintln!(
+                            "prompt-parole watchdog: could not start input guard (attempt {failures}): {err}"
+                        );
+                        // Stop opening recovery windows on a loop when the guard
+                        // cannot stay up (usually missing Accessibility/Input
+                        // Monitoring permission); back off and try again later.
+                        if failures >= WATCHDOG_MAX_ATTEMPTS {
+                            eprintln!(
+                                "prompt-parole watchdog: backing off for {} minutes. Grant Accessibility/Input Monitoring permission to prompt-parole, then it will retry.",
+                                WATCHDOG_BACKOFF.as_secs() / 60
+                            );
+                            backoff_until = Some(Instant::now() + WATCHDOG_BACKOFF);
+                            failures = 0;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Guard is healthy.
+            failures = 0;
+            backoff_until = None;
         }
         thread::sleep(StdDuration::from_secs(interval_seconds));
     }
 }
 
-#[cfg(target_os = "macos")]
-fn recover_guard_from_watchdog(core: &ParoleCore) -> Result<(), String> {
-    let _ = core;
-    start_terminal_guard()
-}
-
-#[cfg(not(target_os = "macos"))]
+// Recover by re-launching the headless launchd guard — never a Terminal window.
 fn recover_guard_from_watchdog(core: &ParoleCore) -> Result<(), String> {
     start_guard_once(core)
 }
 
-#[cfg(target_os = "macos")]
-fn start_terminal_guard() -> Result<(), String> {
-    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("prompt-parole"));
-    let command = format!("{} guard", shell_quote(&exe.to_string_lossy()));
-    let script = format!(
-        "tell application \"Terminal\" to do script \"{}\"",
-        applescript_string_escape(&command)
-    );
-    let output = Command::new("osascript")
-        .args(["-e", &script])
-        .output()
-        .map_err(|err| format!("Could not start Terminal input guard: {err}"))?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+/// Open the macOS Input Monitoring privacy pane so the user can grant permission.
+fn open_input_monitoring_settings() {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+            .status();
     }
-    thread::sleep(StdDuration::from_millis(900));
-    if input_guard_running() {
-        Ok(())
-    } else {
-        Err("Input guard did not stay running. Check macOS Accessibility/Input Monitoring permission for Terminal or prompt-parole.".to_owned())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn applescript_string_escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
 }
 
 fn stop_guard_agent(core: &ParoleCore) -> Result<(), String> {
@@ -2702,11 +3218,15 @@ fn stop_guard_agent(core: &ParoleCore) -> Result<(), String> {
         let domain = launchctl_domain()?;
         let guard_target = launchctl_target(&domain, GUARD_AGENT_LABEL);
         let watchdog_target = launchctl_target(&domain, GUARD_WATCHDOG_LABEL);
-        let result = stop_launchctl_target(&guard_target)
-            .and_then(|_| stop_launchctl_target(&watchdog_target));
-        stop_guard_processes();
+        // Tear down the watchdog FIRST so it cannot resurrect the guard between
+        // when we kill the guard and when we would kill the watchdog. Both bootouts
+        // run regardless of either's error so a watchdog failure can't leave the
+        // guard agent loaded.
+        let watchdog_result = stop_launchctl_target(&watchdog_target);
+        let guard_result = stop_launchctl_target(&guard_target);
         stop_guard_watchdog_processes();
-        result
+        stop_guard_processes();
+        watchdog_result.and(guard_result)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -2728,35 +3248,68 @@ fn stop_guard_watchdog_processes() {
 }
 
 fn prompt_parole_process_pids(command_arg: &str) -> Vec<u32> {
-    let Ok(output) = Command::new("ps").args(["-axo", "pid=,args="]).output() else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let self_pid = std::process::id().to_string();
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| parse_prompt_parole_process_line(line, &self_pid, command_arg))
+    // Read the executable path (comm) and full command line (args) separately so a
+    // bundle path containing a space (".../Prompt Parole.app/.../prompt-parole")
+    // is identified by its real basename rather than split mid-path.
+    let exes = ps_field_map("comm");
+    let args = ps_field_map("args");
+    let self_pid = std::process::id();
+    exes.into_iter()
+        .filter(|(pid, _)| *pid != self_pid)
+        .filter_map(|(pid, exe)| {
+            let arg_line = args.get(&pid).map(String::as_str).unwrap_or("");
+            process_matches(&exe, arg_line, command_arg).then_some(pid)
+        })
         .collect()
 }
 
-fn parse_prompt_parole_process_line(line: &str, self_pid: &str, command_arg: &str) -> Option<u32> {
+fn ps_field_map(field: &str) -> HashMap<u32, String> {
+    let format = format!("pid=,{field}=");
+    let mut map = HashMap::new();
+    let Ok(output) = Command::new("ps").args(["-axww", "-o", &format]).output() else {
+        return map;
+    };
+    if !output.status.success() {
+        return map;
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some((pid, rest)) = split_pid_line(line) {
+            map.insert(pid, rest.to_owned());
+        }
+    }
+    map
+}
+
+fn split_pid_line(line: &str) -> Option<(u32, &str)> {
     let mut parts = line.trim_start().splitn(2, char::is_whitespace);
-    let pid = parts.next()?;
-    if pid == self_pid {
-        return None;
+    let pid = parts.next()?.parse().ok()?;
+    Some((pid, parts.next().unwrap_or("").trim_start()))
+}
+
+/// True if `exe_path` (the process's executable) is prompt-parole and its first
+/// argument is `command_arg`. Tolerant of spaces in the executable path.
+fn process_matches(exe_path: &str, args: &str, command_arg: &str) -> bool {
+    let exe_path = exe_path.trim();
+    if Path::new(exe_path).file_name().and_then(|name| name.to_str()) != Some("prompt-parole") {
+        return false;
     }
-    let args = parts.next().unwrap_or("");
-    let mut arg_parts = args.split_whitespace();
-    let exe = arg_parts.next()?;
-    let exe_name = Path::new(exe).file_name()?.to_str()?;
-    if exe_name != "prompt-parole" {
-        return None;
-    }
-    arg_parts
-        .any(|arg| arg == command_arg)
-        .then(|| pid.parse().ok())?
+    // `args` starts with the executable path; the subcommand is the token after it.
+    let subcommand = args
+        .trim_start()
+        .strip_prefix(exe_path)
+        .map(str::trim_start)
+        .and_then(|rest| rest.split_whitespace().next())
+        .or_else(|| {
+            let tokens: Vec<&str> = args.split_whitespace().collect();
+            tokens
+                .iter()
+                .position(|token| {
+                    Path::new(token).file_name().and_then(|name| name.to_str())
+                        == Some("prompt-parole")
+                })
+                .and_then(|index| tokens.get(index + 1).copied())
+        });
+    subcommand == Some(command_arg)
 }
 
 fn guard_agent_plist_path() -> Result<PathBuf, String> {
@@ -2786,7 +3339,7 @@ fn write_guard_watchdog_plist(core: &ParoleCore, path: &Path) -> Result<(), Stri
         core,
         path,
         GUARD_WATCHDOG_LABEL,
-        &["guard-watchdog", "--interval-seconds", "2"],
+        &["guard-watchdog", "--interval-seconds", "5"],
         "guard-watchdog",
     )
 }
@@ -2926,7 +3479,7 @@ fn platform_foreground_target() -> Result<ForegroundTarget, String> {
         format!("{}: {}", window.owner, window.title)
     };
     Ok(ForegroundTarget {
-        target_focused: window_is_agent_target(&window.owner, &window.title),
+        target_focused: window_info_is_target(&window),
         name,
     })
 }
@@ -2949,13 +3502,57 @@ fn platform_run_input_guard() -> Result<i32, String> {
     Err("Input Guard is currently implemented only for macOS.".to_owned())
 }
 
+/// Terminal emulators that title their window with the running command, so a
+/// title match is a reliable signal that Codex/Claude is in the foreground.
+const TERMINAL_OWNERS: [&str; 9] = [
+    "terminal",
+    "iterm2",
+    "iterm",
+    "ghostty",
+    "kitty",
+    "wezterm",
+    "alacritty",
+    "hyper",
+    "tabby",
+];
+
 fn window_is_agent_target(owner: &str, title: &str) -> bool {
     let owner = owner.to_ascii_lowercase();
     let title = title.to_ascii_lowercase();
     if owner.contains("codex") || owner.contains("claude") {
         return true;
     }
-    owner == "terminal" && (title.contains("codex") || title.contains("claude"))
+    TERMINAL_OWNERS.contains(&owner.as_str())
+        && (title.contains("codex") || title.contains("claude"))
+}
+
+/// True if a process named like the agent (`claude`/`codex`) is `root` or a
+/// descendant of it. Pure over `rows` = (pid, ppid, comm) so it is unit-testable.
+fn tree_has_agent(rows: &[(i32, i32, String)], root: i32) -> bool {
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        for (child, parent, comm) in rows {
+            if *parent == pid {
+                if comm_is_agent(comm) {
+                    return true;
+                }
+                stack.push(*child);
+            }
+            if *child == pid && comm_is_agent(comm) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn comm_is_agent(comm: &str) -> bool {
+    let comm = comm.to_ascii_lowercase();
+    comm.contains("claude") || comm.contains("codex")
 }
 
 #[cfg(target_os = "macos")]
@@ -2977,11 +3574,13 @@ mod macos_front_window {
     pub struct WindowInfo {
         pub owner: String,
         pub title: String,
+        pub pid: i32,
     }
 
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         static kCGWindowOwnerName: CfStringRef;
+        static kCGWindowOwnerPID: CfStringRef;
         static kCGWindowName: CfStringRef;
         static kCGWindowLayer: CfStringRef;
         fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CfArrayRef;
@@ -2999,6 +3598,8 @@ mod macos_front_window {
             buffer_size: CfIndex,
             encoding: u32,
         ) -> bool;
+        fn CFStringGetLength(string: CfStringRef) -> CfIndex;
+        fn CFStringGetMaximumSizeForEncoding(length: CfIndex, encoding: u32) -> CfIndex;
         fn CFRelease(value: *const c_void);
     }
 
@@ -3032,7 +3633,8 @@ mod macos_front_window {
                     continue;
                 }
                 let title = dictionary_string(dict, kCGWindowName).unwrap_or_default();
-                result = Some(WindowInfo { owner, title });
+                let pid = window_int(dict, kCGWindowOwnerPID).unwrap_or(0);
+                result = Some(WindowInfo { owner, title, pid });
                 break;
             }
             CFRelease(list);
@@ -3041,7 +3643,11 @@ mod macos_front_window {
     }
 
     unsafe fn window_layer(dict: CfDictionaryRef) -> Option<i32> {
-        let value = unsafe { CFDictionaryGetValue(dict, kCGWindowLayer) as CfNumberRef };
+        unsafe { window_int(dict, kCGWindowLayer) }
+    }
+
+    unsafe fn window_int(dict: CfDictionaryRef, key: CfStringRef) -> Option<i32> {
+        let value = unsafe { CFDictionaryGetValue(dict, key) as CfNumberRef };
         if value.is_null() {
             return None;
         }
@@ -3065,7 +3671,16 @@ mod macos_front_window {
     }
 
     unsafe fn cf_string(value: CfStringRef) -> Option<String> {
-        let mut buffer = [0_i8; 1024];
+        // Size the buffer to the string's actual UTF-8 length (+1 for NUL) so long
+        // window titles are not silently dropped by a fixed-size buffer.
+        let length = unsafe { CFStringGetLength(value) };
+        if length <= 0 {
+            return Some(String::new());
+        }
+        let max =
+            unsafe { CFStringGetMaximumSizeForEncoding(length, K_CF_STRING_ENCODING_UTF8) }.max(0);
+        let capacity = (max as usize).saturating_add(1);
+        let mut buffer = vec![0_i8; capacity];
         let ok = unsafe {
             CFStringGetCString(
                 value,
@@ -3091,12 +3706,10 @@ mod macos_front_window {
 
 #[cfg(target_os = "macos")]
 mod macos_event_tap {
-    use super::{INPUT_BLOCKED, should_block_guard_key};
+    use super::{CURFEW_ACTIVE, current_window_is_target, should_block_guard_key};
     use std::ffi::c_void;
     use std::ptr;
-    use std::sync::atomic::Ordering;
-    use std::thread;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicPtr, Ordering};
 
     type CgEventTapProxy = *mut c_void;
     type CgEventRef = *mut c_void;
@@ -3113,6 +3726,14 @@ mod macos_event_tap {
     const K_CG_EVENT_TAP_OPTION_DEFAULT: u32 = 0;
     const K_CG_EVENT_KEY_DOWN: u32 = 10;
     const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+    // macOS delivers these special event types to the callback when it disables
+    // the tap (callback too slow, or a burst of user input). We must re-enable it.
+    const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+    const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
+
+    /// The tap's mach port, stored so the callback can re-enable it. The callback's
+    /// proxy argument is NOT the port and cannot be passed to CGEventTapEnable.
+    static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
@@ -3153,11 +3774,23 @@ mod macos_event_tap {
         event: CgEventRef,
         _user_info: *mut c_void,
     ) -> CgEventRef {
-        if event_type == K_CG_EVENT_KEY_DOWN && INPUT_BLOCKED.load(Ordering::Relaxed) {
+        // If macOS disabled the tap, re-enable it immediately (do not wait for the
+        // run-loop timeout, which would leave the curfew unenforced for up to an hour).
+        if event_type == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+            || event_type == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+        {
+            let port = TAP_PORT.load(Ordering::Acquire);
+            if !port.is_null() {
+                unsafe { CGEventTapEnable(port, true) };
+            }
+            return event;
+        }
+        if event_type == K_CG_EVENT_KEY_DOWN && CURFEW_ACTIVE.load(Ordering::Relaxed) {
             let key_code =
                 unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
             let flags = unsafe { CGEventGetFlags(event) };
-            if should_block_guard_key(key_code, flags) {
+            // Only pay for the live focus check on keys we would actually block.
+            if should_block_guard_key(key_code, flags) && current_window_is_target() {
                 return ptr::null_mut();
             }
         }
@@ -3181,6 +3814,7 @@ mod macos_event_tap {
                         .to_owned(),
                 );
             }
+            TAP_PORT.store(tap, Ordering::Release);
             let source = CFMachPortCreateRunLoopSource(ptr::null(), tap, 0);
             if source.is_null() {
                 return Err("Could not create macOS event-tap run loop source.".to_owned());
@@ -3189,10 +3823,12 @@ mod macos_event_tap {
             CFRunLoopAddSource(run_loop, source, kCFRunLoopDefaultMode);
             CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
             CGEventTapEnable(tap, true);
+            // The callback re-enables the tap immediately when macOS disables it, so
+            // the run loop can block continuously (no per-iteration sleep that would
+            // hold keystrokes). The long timeout + re-enable is a cheap backstop.
             loop {
                 CGEventTapEnable(tap, true);
                 CFRunLoopRunInMode(kCFRunLoopDefaultMode, 3600.0, false);
-                thread::sleep(Duration::from_millis(250));
             }
         }
     }
@@ -3257,18 +3893,68 @@ fn launcher_installed(target: &str) -> bool {
 }
 
 fn command_uses_launcher(target: &str) -> bool {
-    find_on_path(target).is_some_and(|path| is_prompt_parole_launcher(&path))
+    // Use the login shell's PATH, not this process's. A GUI .app launched from
+    // Finder inherits a minimal PATH and would otherwise miss ~/.local/bin and
+    // wrongly report "Needs install" / "Not first in PATH".
+    find_on_path_in(&effective_shell_path(), target)
+        .is_some_and(|path| is_prompt_parole_launcher(&path))
 }
 
-fn find_on_path(target: &str) -> Option<PathBuf> {
-    let paths = env::var_os("PATH")?;
-    for dir in env::split_paths(&paths) {
+fn find_on_path_in(paths: &std::ffi::OsStr, target: &str) -> Option<PathBuf> {
+    for dir in env::split_paths(paths) {
         let candidate = dir.join(target);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
     None
+}
+
+/// The PATH the user's interactive terminal would see, queried from the login
+/// shell once and cached. Falls back to this process's PATH.
+fn effective_shell_path() -> std::ffi::OsString {
+    static CACHE: OnceLock<std::ffi::OsString> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if let Some(stdout) = login_shell_path_output()
+                && let Some(path) = stdout
+                    .lines()
+                    .rev()
+                    .find_map(|line| line.strip_prefix("PP_PATH="))
+                && !path.trim().is_empty()
+            {
+                return std::ffi::OsString::from(path.trim());
+            }
+            env::var_os("PATH").unwrap_or_default()
+        })
+        .clone()
+}
+
+/// Run the login shell to print `$PATH`, bounded by a timeout so a slow or hanging
+/// shell init cannot wedge the thread that calls this.
+fn login_shell_path_output() -> Option<String> {
+    use std::process::Stdio;
+    let shell = env::var_os("SHELL")?;
+    let mut child = Command::new(&shell)
+        .args(["-lic", "printf 'PP_PATH=%s\\n' \"$PATH\""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let result = rx.recv_timeout(StdDuration::from_secs(3)).ok();
+    // Reap the shell (kill it if it overran the timeout); the reader thread then
+    // sees EOF and exits on its own.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 struct LauncherInstallReport {
@@ -3280,13 +3966,15 @@ fn install_launcher(target: &str, bin_dir: Option<&Path>) -> Result<LauncherInst
     let dir = launcher_bin_dir(bin_dir)?;
     fs::create_dir_all(&dir).map_err(|err| format!("Could not create {}: {err}", dir.display()))?;
     let wrapper = dir.join(target);
-    let real = locate_real_agent_binary(target, &wrapper)?;
+    // If a non-launcher file already occupies the wrapper path, move it aside FIRST.
+    // That file is the user's real agent, so the wrapper must then point at the backup
+    // (not at the now-vacated wrapper path).
     let backup = if wrapper.exists() && !is_prompt_parole_launcher(&wrapper) {
-        let backup = wrapper.with_file_name(format!(
+        let backup = unique_path(&wrapper.with_file_name(format!(
             "{}.prompt-parole.backup.{}",
             target,
             Utc::now().format("%Y%m%d%H%M%S")
-        ));
+        )));
         fs::rename(&wrapper, &backup).map_err(|err| {
             format!(
                 "Could not back up {} to {}: {err}",
@@ -3298,9 +3986,33 @@ fn install_launcher(target: &str, bin_dir: Option<&Path>) -> Result<LauncherInst
     } else {
         None
     };
+    let real = match &backup {
+        // The file we just backed up was the real agent (or a symlink to it).
+        Some(path) if path.is_file() => path.clone(),
+        _ => locate_real_agent_binary(target, &wrapper)?,
+    };
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("prompt-parole"));
     write_launcher_script(&wrapper, &exe, target, &real)?;
     Ok(LauncherInstallReport { wrapper, backup })
+}
+
+/// Append a numeric suffix until the path does not exist, so same-second backups
+/// never overwrite each other.
+fn unique_path(base: &Path) -> PathBuf {
+    if !base.exists() {
+        return base.to_path_buf();
+    }
+    let name = base
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("backup");
+    for suffix in 1..10_000 {
+        let candidate = base.with_file_name(format!("{name}.{suffix}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    base.to_path_buf()
 }
 
 fn uninstall_launcher(target: &str, bin_dir: Option<&Path>) -> Result<Option<PathBuf>, String> {
@@ -3339,46 +4051,68 @@ fn launcher_bin_dir(bin_dir: Option<&Path>) -> Result<PathBuf, String> {
 }
 
 fn locate_real_agent_binary(target: &str, wrapper: &Path) -> Result<PathBuf, String> {
-    if wrapper.exists()
-        && !is_prompt_parole_launcher(wrapper)
-        && let Ok(path) = fs::canonicalize(wrapper)
-    {
+    // A non-launcher file at the wrapper path is the real agent.
+    if wrapper.exists() && !is_prompt_parole_launcher(wrapper) {
+        return Ok(wrapper.to_path_buf());
+    }
+
+    // Search the login shell's PATH (not this process's — a Finder-launched .app
+    // has a minimal PATH), keeping the STABLE path: do NOT canonicalize, which
+    // resolves Homebrew/cask symlinks to a version-pinned path that disappears on
+    // the next `brew upgrade`.
+    let candidates = first_real_agent_candidate(
+        env::split_paths(&effective_shell_path())
+            .map(|dir| dir.join(target).to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(String::as_str),
+        wrapper,
+    );
+    if let Some(path) = candidates {
         return Ok(path);
     }
 
-    let output = Command::new("which")
-        .args(["-a", target])
-        .output()
-        .map_err(|err| format!("Could not find {target}: {err}"))?;
-    if output.status.success()
-        && let Some(path) =
-            first_real_agent_candidate(String::from_utf8_lossy(&output.stdout).lines(), wrapper)
-    {
-        return fs::canonicalize(&path)
-            .map_err(|err| format!("Could not resolve {}: {err}", path.display()));
-    }
-
-    let known = if target == "codex" {
-        vec![
-            PathBuf::from("/opt/homebrew/bin/codex"),
-            PathBuf::from("/usr/local/bin/codex"),
-            PathBuf::from("/usr/bin/codex"),
-        ]
-    } else {
-        vec![
-            PathBuf::from("/opt/homebrew/bin/claude"),
-            PathBuf::from("/usr/local/bin/claude"),
-            PathBuf::from("/usr/bin/claude"),
-        ]
-    };
-    for path in known {
+    for path in known_agent_paths(target) {
         if path.exists() && path != wrapper {
-            return fs::canonicalize(&path)
-                .map_err(|err| format!("Could not resolve {}: {err}", path.display()));
+            return Ok(path);
         }
     }
 
+    // Last resort: a previous install backed up the real agent next to the wrapper.
+    // Without this, re-installing when the only real binary lives in the backup
+    // would fail outright.
+    if let Some(dir) = wrapper.parent()
+        && let Ok(Some(backup)) = latest_launcher_backup(dir, target)
+        && backup.is_file()
+    {
+        return Ok(backup);
+    }
+
     Err(format!("Could not find the real {target} binary."))
+}
+
+fn known_agent_paths(target: &str) -> Vec<PathBuf> {
+    ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+        .iter()
+        .map(|dir| PathBuf::from(dir).join(target))
+        .collect()
+}
+
+/// Resolve the real agent binary at launch time, skipping Prompt Parole launchers.
+/// Lets an already-installed wrapper survive an agent upgrade that moved/renamed
+/// the binary the wrapper was built against.
+fn resolve_agent_at_runtime(target: &str) -> Option<PathBuf> {
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            let candidate = dir.join(target);
+            if candidate.is_file() && !is_prompt_parole_launcher(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    known_agent_paths(target)
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 fn first_real_agent_candidate<'a>(
@@ -3469,13 +4203,31 @@ fn install_macos_app_bundle(app_dir: Option<&Path>) -> Result<PathBuf, String> {
     let bundled_exe = macos.join("prompt-parole");
     let same_file = fs::canonicalize(&exe).ok() == fs::canonicalize(&bundled_exe).ok();
     if !same_file {
-        fs::copy(&exe, &bundled_exe).map_err(|err| {
+        // Copy to a temp file and rename into place (a fresh inode) rather than
+        // overwriting the running binary's inode. Overwriting in place invalidates
+        // the kernel's cached code signature and the next launch is SIGKILLed
+        // ("Killed: 9") on Apple Silicon.
+        let staging = macos.join("prompt-parole.new");
+        let _ = fs::remove_file(&staging);
+        fs::copy(&exe, &staging).map_err(|err| {
             format!(
                 "Could not copy {} to {}: {err}",
                 exe.display(),
-                bundled_exe.display()
+                staging.display()
             )
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
+                .map_err(|err| format!("Could not make {} executable: {err}", staging.display()))?;
+        }
+        fs::rename(&staging, &bundled_exe).map_err(|err| {
+            format!("Could not install {}: {err}", bundled_exe.display())
+        })?;
+        // Re-establish a valid ad-hoc signature for the freshly written bytes, so
+        // the binary is not killed for a signature mismatch.
+        adhoc_codesign(&bundled_exe)?;
     }
     #[cfg(unix)]
     {
@@ -3484,11 +4236,81 @@ fn install_macos_app_bundle(app_dir: Option<&Path>) -> Result<PathBuf, String> {
             .map_err(|err| format!("Could not make {} executable: {err}", bundled_exe.display()))?;
     }
 
+    install_app_icon(&resources)?;
     fs::write(contents.join("Info.plist"), macos_app_info_plist())
         .map_err(|err| format!("Could not write Info.plist: {err}"))?;
     fs::write(contents.join("PkgInfo"), "APPL????\n")
         .map_err(|err| format!("Could not write PkgInfo: {err}"))?;
     Ok(app)
+}
+
+/// Render the icon at every macOS iconset resolution and build Resources/AppIcon.icns.
+#[cfg(target_os = "macos")]
+fn install_app_icon(resources: &Path) -> Result<(), String> {
+    let iconset = resources.join("AppIcon.iconset");
+    let _ = fs::remove_dir_all(&iconset);
+    fs::create_dir_all(&iconset)
+        .map_err(|err| format!("Could not create {}: {err}", iconset.display()))?;
+    // (filename, pixel size) for the standard macOS iconset.
+    const ENTRIES: [(&str, u32); 10] = [
+        ("icon_16x16.png", 16),
+        ("icon_16x16@2x.png", 32),
+        ("icon_32x32.png", 32),
+        ("icon_32x32@2x.png", 64),
+        ("icon_128x128.png", 128),
+        ("icon_128x128@2x.png", 256),
+        ("icon_256x256.png", 256),
+        ("icon_256x256@2x.png", 512),
+        ("icon_512x512.png", 512),
+        ("icon_512x512@2x.png", 1024),
+    ];
+    for (name, size) in ENTRIES {
+        write_icon_png(&iconset.join(name), size)?;
+    }
+    let icns = resources.join("AppIcon.icns");
+    let output = Command::new("iconutil")
+        .args(["-c", "icns"])
+        .arg(&iconset)
+        .arg("-o")
+        .arg(&icns)
+        .output()
+        .map_err(|err| format!("Could not run iconutil: {err}"))?;
+    let _ = fs::remove_dir_all(&iconset);
+    if !output.status.success() {
+        return Err(format!(
+            "iconutil failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn write_icon_png(path: &Path, size: u32) -> Result<(), String> {
+    let rgba = render_icon(size);
+    let image = image::RgbaImage::from_raw(size, size, rgba)
+        .ok_or_else(|| "icon buffer size mismatch".to_owned())?;
+    image
+        .save_with_format(path, image::ImageFormat::Png)
+        .map_err(|err| format!("Could not write {}: {err}", path.display()))
+}
+
+/// Ad-hoc re-sign a Mach-O so it is not SIGKILLed for an invalid signature.
+#[cfg(target_os = "macos")]
+fn adhoc_codesign(path: &Path) -> Result<(), String> {
+    let output = Command::new("codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(path)
+        .output()
+        .map_err(|err| format!("Could not run codesign: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "codesign failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3512,6 +4334,8 @@ fn macos_app_info_plist() -> String {
   <string>{name}</string>
   <key>CFBundleExecutable</key>
   <string>{executable}</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>{identifier}</string>
   <key>CFBundleName</key>
@@ -3579,6 +4403,20 @@ fn launch_agent(
             return Ok(1);
         }
     }
+    // The baked `--real` path can disappear when the agent is upgraded (e.g. a
+    // Homebrew cask version bump). Re-resolve on PATH so the wrapper keeps working.
+    let resolved;
+    let real = if real.is_file() {
+        real
+    } else {
+        resolved = resolve_agent_at_runtime(agent).ok_or_else(|| {
+            format!(
+                "Could not find the {agent} binary (it may have been upgraded or removed). \
+                 Reinstall the Prompt Parole launcher to repair it."
+            )
+        })?;
+        resolved.as_path()
+    };
     let mut command = Command::new(real);
     if agent == "codex"
         && !args
@@ -3664,7 +4502,7 @@ fn install_json_hook(
         }]
     }));
     let backup = backup_file(path)?;
-    write_json_atomic(path, &data)?;
+    write_json_shared(path, &data)?;
     Ok(backup)
 }
 
@@ -3675,7 +4513,7 @@ fn uninstall_json_hook(path: &Path) -> Result<(usize, Option<PathBuf>), String> 
         return Ok((0, None));
     }
     let backup = backup_file(path)?;
-    write_json_atomic(path, &data)?;
+    write_json_shared(path, &data)?;
     Ok((removed, backup))
 }
 
@@ -3762,15 +4600,140 @@ fn backup_file(path: &Path) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let stamp = Utc::now().format("%Y%m%d%H%M%S");
-    let backup = path.with_file_name(format!(
+    let backup = unique_path(&path.with_file_name(format!(
         "{}.bak.{stamp}",
         path.file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("config")
-    ));
+    )));
     fs::copy(path, &backup)
         .map_err(|err| format!("Could not create backup {}: {err}", backup.display()))?;
     Ok(Some(backup))
+}
+
+// ---------------------------------------------------------------------------
+// App icon — minimalist padlock, Nippon palette only. Rendered procedurally so
+// the window icon and the macOS .icns are always the same image.
+// ---------------------------------------------------------------------------
+
+/// Render the app icon as RGBA8 at `size`×`size`: an aomidori rounded tile with a
+/// shironeri padlock. Only Nippon palette colors are used.
+fn render_icon(size: u32) -> Vec<u8> {
+    let s = size as f32;
+    let bg = aomidori(); // deep green tile
+    let fg = shironeri(); // off-white lock
+
+    // Rounded tile, leaving a margin so it reads as a floating macOS app icon.
+    let tile_inset = s * 0.085;
+    let tile_half = (s - tile_inset * 2.0) * 0.5;
+    let tile_c = s * 0.5;
+    let tile_radius = tile_half * 0.45;
+
+    // Padlock body.
+    let cx = s * 0.5;
+    let body_cy = s * 0.60;
+    let body_hx = s * 0.23;
+    let body_hy = s * 0.17;
+    let body_radius = s * 0.06;
+    let body_top = body_cy - body_hy;
+
+    // Shackle (inverted U above the body); legs run down into the body.
+    let shackle_cy = body_top;
+    let shackle_r = s * 0.135;
+    let shackle_half_t = s * 0.031;
+    let leg_bottom = body_cy;
+
+    // Keyhole (circle + slot) cut back to the tile color.
+    let key_cy = body_cy - s * 0.02;
+    let key_r = s * 0.045;
+    let slot_half_w = s * 0.015;
+    let slot_bottom = key_cy + s * 0.085;
+
+    let mut out = vec![0_u8; (size * size * 4) as usize];
+    for py in 0..size {
+        for px in 0..size {
+            let x = px as f32 + 0.5;
+            let y = py as f32 + 0.5;
+
+            let tile_cov = coverage(sdf_round_rect(
+                x, y, tile_c, tile_c, tile_half, tile_half, tile_radius,
+            ));
+            if tile_cov <= 0.0 {
+                continue; // transparent outside the tile
+            }
+
+            let body_d = sdf_round_rect(x, y, cx, body_cy, body_hx, body_hy, body_radius);
+            let shackle_d = sdf_shackle(x, y, cx, shackle_cy, shackle_r, leg_bottom) - shackle_half_t;
+            let mut lock_cov = coverage(body_d.min(shackle_d));
+
+            let key_d = (distance(x, y, cx, key_cy) - key_r).min(sdf_round_rect(
+                x,
+                y,
+                cx,
+                (key_cy + slot_bottom) * 0.5,
+                slot_half_w,
+                (slot_bottom - key_cy) * 0.5,
+                slot_half_w,
+            ));
+            lock_cov *= 1.0 - coverage(key_d);
+
+            let idx = ((py * size + px) * 4) as usize;
+            out[idx] = mix(bg.r(), fg.r(), lock_cov);
+            out[idx + 1] = mix(bg.g(), fg.g(), lock_cov);
+            out[idx + 2] = mix(bg.b(), fg.b(), lock_cov);
+            out[idx + 3] = (tile_cov * 255.0).round() as u8;
+        }
+    }
+    out
+}
+
+/// Coverage in [0,1] from a signed distance (negative = inside), ~1px antialiasing.
+fn coverage(distance: f32) -> f32 {
+    (0.5 - distance).clamp(0.0, 1.0)
+}
+
+fn mix(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+fn distance(x: f32, y: f32, cx: f32, cy: f32) -> f32 {
+    ((x - cx).powi(2) + (y - cy).powi(2)).sqrt()
+}
+
+/// Signed distance to a rounded rectangle (center, half-extents, corner radius).
+fn sdf_round_rect(x: f32, y: f32, cx: f32, cy: f32, hx: f32, hy: f32, r: f32) -> f32 {
+    let qx = (x - cx).abs() - hx + r;
+    let qy = (y - cy).abs() - hy + r;
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let inside = qx.max(qy).min(0.0);
+    outside + inside - r
+}
+
+/// Signed distance to an inverted-U centerline: a top semicircle plus two legs.
+fn sdf_shackle(x: f32, y: f32, cx: f32, scy: f32, r: f32, leg_bottom: f32) -> f32 {
+    let arc = if y <= scy {
+        (distance(x, y, cx, scy) - r).abs()
+    } else {
+        distance(x, y, cx - r, scy).min(distance(x, y, cx + r, scy))
+    };
+    let left = dist_to_vsegment(x, y, cx - r, scy, leg_bottom);
+    let right = dist_to_vsegment(x, y, cx + r, scy, leg_bottom);
+    arc.min(left).min(right)
+}
+
+/// Distance from a point to a vertical segment at `vx` spanning `[y0, y1]`.
+fn dist_to_vsegment(x: f32, y: f32, vx: f32, y0: f32, y1: f32) -> f32 {
+    let clamped_y = y.clamp(y0.min(y1), y0.max(y1));
+    distance(x, y, vx, clamped_y)
+}
+
+fn icon_data() -> egui::IconData {
+    let size = 256;
+    egui::IconData {
+        rgba: render_icon(size),
+        width: size,
+        height: size,
+    }
 }
 
 fn run_gui() -> eframe::Result {
@@ -3778,7 +4741,8 @@ fn run_gui() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Prompt Parole")
             .with_inner_size([760.0, 460.0])
-            .with_min_inner_size([620.0, 400.0]),
+            .with_min_inner_size([620.0, 400.0])
+            .with_icon(std::sync::Arc::new(icon_data())),
         centered: true,
         persist_window: false,
         ..Default::default()
@@ -3876,6 +4840,35 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-06-21T03:00:00+08:00").unwrap();
         let until = scheduled_lock_until(&config, now).unwrap().unwrap();
         assert_eq!(until.to_rfc3339(), "2026-06-21T05:00:00+08:00");
+    }
+
+    #[test]
+    fn schedule_resolves_lock_end_at_the_correct_dst_offset() {
+        // Sat 19:00 -> Sun 05:00 across US spring-forward (2026-03-08 02:00).
+        // The end is 05:00 EDT (-04:00) = 09:00 UTC, NOT 05:00 EST (-05:00).
+        let config = normalize_config(Config {
+            version: 1,
+            timezone: "America/New_York".to_owned(),
+            unlock_duration_minutes: 30,
+            password_required_for: vec!["unlock".to_owned()],
+            lock_windows: vec![LockWindow {
+                start: "19:00".to_owned(),
+                end: "05:00".to_owned(),
+                days: vec!["sat".to_owned()],
+            }],
+            log_prompt_text: false,
+        })
+        .unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-03-07T23:00:00-05:00")
+            .unwrap()
+            .with_timezone(&chrono_tz::America::New_York);
+        let end = scheduled_lock_until(&config, now).unwrap().unwrap();
+        assert_eq!(
+            end.to_utc(),
+            DateTime::parse_from_rfc3339("2026-03-08T09:00:00Z")
+                .unwrap()
+                .to_utc()
+        );
     }
 
     #[test]
@@ -4142,6 +5135,27 @@ mod tests {
         assert!(plist.contains("<string>prompt-parole</string>"));
         assert!(plist.contains("<key>CFBundlePackageType</key>"));
         assert!(plist.contains("<string>APPL</string>"));
+        assert!(plist.contains("<key>CFBundleIconFile</key>"));
+        assert!(plist.contains("<string>AppIcon</string>"));
+    }
+
+    #[test]
+    fn icon_is_rgba_with_transparent_corners_and_opaque_center() {
+        let size = 64;
+        let rgba = render_icon(size);
+        assert_eq!(rgba.len(), (size * size * 4) as usize);
+        let alpha = |x: u32, y: u32| rgba[((y * size + x) * 4 + 3) as usize];
+        // Corners sit outside the rounded tile -> transparent.
+        assert_eq!(alpha(0, 0), 0);
+        assert_eq!(alpha(size - 1, size - 1), 0);
+        // Center sits inside the tile -> opaque.
+        assert_eq!(alpha(size / 2, size / 2), 255);
+        // The lock (shironeri) is brighter than the tile (aomidori): some pixel is light.
+        let lightest = (0..size * size)
+            .map(|i| rgba[(i * 4) as usize] as u32)
+            .max()
+            .unwrap();
+        assert!(lightest > 200, "expected a light lock pixel, got {lightest}");
     }
 
     #[test]
@@ -4169,69 +5183,108 @@ mod tests {
             "work -- claude -- 100x40"
         ));
         assert!(window_is_agent_target("Codex", "workspace"));
+        // Third-party terminal emulators that title with the running command.
+        assert!(window_is_agent_target("iTerm2", "claude"));
+        assert!(window_is_agent_target("Ghostty", "~ — codex"));
+        assert!(window_is_agent_target("WezTerm", "codex session"));
         assert!(!window_is_agent_target("Terminal", "plain zsh"));
         assert!(!window_is_agent_target("Google Chrome", "codex docs"));
+        // A terminal not running an agent (title does not mention it) must not match.
+        assert!(!window_is_agent_target("iTerm2", "vim notes.txt"));
+    }
+
+    #[test]
+    fn process_tree_detects_agent_descendant() {
+        // 100 (iTerm2) -> 200 (zsh) -> 300 (claude)
+        let rows = vec![
+            (100, 1, "/Applications/iTerm.app/Contents/MacOS/iTerm2".to_owned()),
+            (200, 100, "/bin/zsh".to_owned()),
+            (300, 200, "/opt/homebrew/bin/claude".to_owned()),
+            (400, 1, "/usr/bin/vim".to_owned()),
+        ];
+        assert!(tree_has_agent(&rows, 100));
+        assert!(tree_has_agent(&rows, 200));
+        assert!(tree_has_agent(&rows, 300));
+        assert!(!tree_has_agent(&rows, 400));
+        assert!(!tree_has_agent(&rows, 999));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn applescript_escape_handles_quotes_and_backslashes() {
+    fn parse_proc_row_handles_real_padded_ps_output() {
+        // Real `ps -o pid=,ppid=,comm=` pads columns with runs of spaces.
         assert_eq!(
-            applescript_string_escape(r#"/tmp/prompt "parole" \ guard"#),
-            r#"/tmp/prompt \"parole\" \\ guard"#
+            parse_proc_row("           332                       1       /usr/libexec/logd"),
+            Some((332, 1, "/usr/libexec/logd".to_owned()))
         );
+        // A comm path containing spaces must be preserved intact.
+        assert_eq!(
+            parse_proc_row("  500   1   /Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+            Some((
+                500,
+                1,
+                "/Applications/Visual Studio Code.app/Contents/MacOS/Electron".to_owned()
+            ))
+        );
+        // Single-space rows still work; junk/header rows are rejected.
+        assert_eq!(
+            parse_proc_row("42 7 /bin/zsh"),
+            Some((42, 7, "/bin/zsh".to_owned()))
+        );
+        assert_eq!(parse_proc_row(""), None);
+        assert_eq!(parse_proc_row("PID PPID COMM"), None);
     }
 
     #[test]
-    fn guard_process_parser_matches_only_real_guard_command() {
+    fn process_tree_does_not_loop_on_cycles() {
+        // Defensive: a malformed parent cycle must terminate.
+        let rows = vec![(1, 2, "/bin/a".to_owned()), (2, 1, "/bin/b".to_owned())];
+        assert!(!tree_has_agent(&rows, 1));
+    }
+
+    #[test]
+    fn guard_process_matcher_matches_only_real_guard_command() {
+        let local = "/Users/jake/.local/bin/prompt-parole";
+        assert!(process_matches(local, &format!("{local} guard"), "guard"));
+        assert!(!process_matches(
+            local,
+            &format!("{local} guard-agent --action stop"),
+            "guard"
+        ));
+        // prompt-parole as an argument to another program (its comm is the shell) must not match.
+        assert!(!process_matches(
+            "/bin/zsh",
+            &format!("/bin/zsh -c {local} guard"),
+            "guard"
+        ));
+        assert!(!process_matches(
+            local,
+            &format!("{local} guard-watchdog"),
+            "guard"
+        ));
+        assert!(process_matches(
+            local,
+            &format!("{local} guard-watchdog"),
+            "guard-watchdog"
+        ));
+        // App-bundle install: executable path contains a space; must still match (regression).
+        let bundle = "/Users/jake/Applications/Prompt Parole.app/Contents/MacOS/prompt-parole";
+        assert!(process_matches(bundle, &format!("{bundle} guard"), "guard"));
+        assert!(process_matches(
+            bundle,
+            &format!("{bundle} guard-watchdog --interval-seconds 2"),
+            "guard-watchdog"
+        ));
+        assert!(!process_matches(bundle, &format!("{bundle} guard"), "guard-watchdog"));
+    }
+
+    #[test]
+    fn split_pid_line_separates_pid_from_rest() {
         assert_eq!(
-            parse_prompt_parole_process_line(
-                "123 /Users/jake/.local/bin/prompt-parole guard",
-                "999",
-                "guard"
-            ),
-            Some(123)
+            split_pid_line("  123 /usr/bin/thing arg"),
+            Some((123, "/usr/bin/thing arg"))
         );
-        assert_eq!(
-            parse_prompt_parole_process_line(
-                "124 /Users/jake/.local/bin/prompt-parole guard-agent --action stop",
-                "999",
-                "guard"
-            ),
-            None
-        );
-        assert_eq!(
-            parse_prompt_parole_process_line(
-                "125 /bin/zsh -c /Users/jake/.local/bin/prompt-parole guard",
-                "999",
-                "guard"
-            ),
-            None
-        );
-        assert_eq!(
-            parse_prompt_parole_process_line(
-                "126 /Users/jake/.local/bin/prompt-parole guard",
-                "126",
-                "guard"
-            ),
-            None
-        );
-        assert_eq!(
-            parse_prompt_parole_process_line(
-                "127 /Users/jake/.local/bin/prompt-parole guard-watchdog",
-                "999",
-                "guard"
-            ),
-            None
-        );
-        assert_eq!(
-            parse_prompt_parole_process_line(
-                "128 /Users/jake/.local/bin/prompt-parole guard-watchdog",
-                "999",
-                "guard-watchdog"
-            ),
-            Some(128)
-        );
+        assert_eq!(split_pid_line("notpid x"), None);
     }
 
     #[test]

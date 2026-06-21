@@ -14,9 +14,13 @@ Repository: <https://github.com/jake-w-liu/prompt-parole>
 ## What It Does
 
 - Blocks Claude Code and Codex prompts during configured hours.
-- Adds a macOS Input Guard for already-open Terminal sessions: it blocks prompt
-  entry/submission keys in focused Codex/Claude tabs while leaving output and
-  navigation visible.
+- Adds a macOS Input Guard for already-open terminal sessions (Terminal, iTerm2,
+  Ghostty, kitty, WezTerm, Alacritty, Hyper, Tabby): it blocks prompt
+  entry/submission keys in focused Codex/Claude windows while leaving output and
+  navigation visible. The focused window is matched by title and, as a fallback,
+  by inspecting the terminal's process tree for a running agent. (Editors/IDEs
+  such as VS Code are intentionally not key-blocked, since that would also block
+  editing; use the hook and launcher layers there.)
 - Uses `UserPromptSubmit` hooks for prompt-time blocking, so existing output
   and progress stay visible.
 - Can install local launch wrappers so new `codex` and `claude` launches are
@@ -188,11 +192,14 @@ decision.
 
 `prompt-parole guard` is the layer for the exact "I can watch output but cannot
 send another prompt" workflow. On macOS it installs a keyboard event tap and
-polls the focused application. When curfew is active and the focused Terminal
-tab is running `codex`, `claude`, or `claude-code`, prompt-entry keys are
-swallowed before Terminal receives them. The terminal process is not paused, so
-output can continue to render. Navigation keys and system shortcuts are left
-alone so the session does not feel frozen.
+checks the focused window on each keystroke. When curfew is active and the
+focused window is running `codex`, `claude`, or `claude-code` (matched by window
+title, or by walking the focused app's process tree), prompt-entry keys are
+swallowed before the terminal receives them. The terminal process is not paused,
+so output can continue to render. Navigation keys and system shortcuts are left
+alone so the session does not feel frozen. If macOS disables the event tap (it
+does this on heavy input or a slow callback), the guard re-enables it
+immediately so the curfew is not silently dropped.
 
 You may need to grant macOS Accessibility/Input Monitoring permission to the
 `prompt-parole` binary the first time the guard starts. If macOS refuses the
@@ -217,7 +224,7 @@ not silently reopen prompting.
 Prompt Parole has three local layers:
 
 1. **Input Guard** blocks prompt-entry keys in the currently focused macOS
-   Codex/Claude Terminal tab during curfew, while output stays visible.
+   Codex/Claude terminal window during curfew, while output stays visible.
 2. **Hooks** block prompt submissions in Claude Code and Codex sessions that have
    loaded and trusted the hook.
 3. **Launch wrappers** block new `codex` and `claude` process launches during
