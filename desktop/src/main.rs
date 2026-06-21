@@ -3330,6 +3330,7 @@ fn guard_watchdog_running() -> bool {
 }
 
 const WATCHDOG_MAX_ATTEMPTS: u32 = 3;
+const WATCHDOG_RETRY_ATTEMPTS_AFTER_BACKOFF: u32 = 1;
 const WATCHDOG_BACKOFF: StdDuration = StdDuration::from_secs(300);
 const WATCHDOG_BACKOFF_POLL: StdDuration = StdDuration::from_secs(60);
 
@@ -3340,6 +3341,14 @@ fn watchdog_backoff_sleep(now: Instant, until: Instant) -> StdDuration {
         .min(WATCHDOG_BACKOFF_POLL)
 }
 
+fn watchdog_attempt_limit(already_backed_off: bool) -> u32 {
+    if already_backed_off {
+        WATCHDOG_RETRY_ATTEMPTS_AFTER_BACKOFF
+    } else {
+        WATCHDOG_MAX_ATTEMPTS
+    }
+}
+
 fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, String> {
     if interval_seconds == 0 {
         return Err("interval-seconds must be positive.".to_owned());
@@ -3348,6 +3357,7 @@ fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, St
     let interval = StdDuration::from_secs(interval_seconds);
     let mut failures: u32 = 0;
     let mut backoff_until: Option<Instant> = None;
+    let mut already_backed_off = false;
     loop {
         let locked = guard_curfew_active(&core);
         // Only try to (re)start the keyboard event-tap guard if the user actually
@@ -3359,6 +3369,7 @@ fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, St
             // Nothing to recover; reset the backoff state.
             failures = 0;
             backoff_until = None;
+            already_backed_off = false;
             thread::sleep(interval);
             continue;
         }
@@ -3377,22 +3388,25 @@ fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, St
                 Ok(()) => {
                     failures = 0;
                     backoff_until = None;
+                    already_backed_off = false;
                 }
                 Err(err) => {
                     failures += 1;
+                    let attempt_limit = watchdog_attempt_limit(already_backed_off);
                     eprintln!(
                         "prompt-parole watchdog: could not start input guard (attempt {failures}): {err}"
                     );
                     // Stop opening recovery windows on a loop when the guard
                     // cannot stay up (usually missing Accessibility/Input
                     // Monitoring permission); back off and try again later.
-                    if failures >= WATCHDOG_MAX_ATTEMPTS {
+                    if failures >= attempt_limit {
                         eprintln!(
                             "prompt-parole watchdog: backing off for {} minutes. Grant Accessibility/Input Monitoring permission to prompt-parole, then it will retry.",
                             WATCHDOG_BACKOFF.as_secs() / 60
                         );
                         backoff_until = Some(Instant::now() + WATCHDOG_BACKOFF);
                         failures = 0;
+                        already_backed_off = true;
                     }
                 }
             }
@@ -3400,6 +3414,7 @@ fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, St
             // Guard is healthy.
             failures = 0;
             backoff_until = None;
+            already_backed_off = false;
         }
         thread::sleep(interval);
     }
@@ -6169,6 +6184,12 @@ mod tests {
             StdDuration::from_secs(12)
         );
         assert_eq!(watchdog_backoff_sleep(now, now), StdDuration::from_secs(0));
+    }
+
+    #[test]
+    fn watchdog_retries_once_after_permission_backoff() {
+        assert_eq!(watchdog_attempt_limit(false), 3);
+        assert_eq!(watchdog_attempt_limit(true), 1);
     }
 
     #[test]
