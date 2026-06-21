@@ -3214,8 +3214,8 @@ fn start_guard_agent(core: &ParoleCore) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         // Try the keyboard guard, but don't let a missing Accessibility permission
-        // abort the watchdog: the watchdog needs no permission, suspends VS Code
-        // agents, and is what retries the keyboard guard once permission is granted.
+        // abort the watchdog: the watchdog needs no permission and retries the
+        // keyboard guard once permission is granted.
         let keyboard = if input_guard_running() {
             Ok(())
         } else {
@@ -3313,19 +3313,17 @@ fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, St
     let mut backoff_until: Option<Instant> = None;
     loop {
         let locked = guard_curfew_active(&core);
-        // Pause/resume VS-Code-launched extension agents by process ancestry
-        // (no-op unless VS Code coverage is installed).
-        manage_vscode_suspension(&core, locked);
         // Only try to (re)start the keyboard event-tap guard if the user actually
         // set it up; VS-Code-only users never started it, so don't churn on it.
         let keyboard_guard_enabled = guard_agent_plist_path()
             .map(|path| path.exists())
             .unwrap_or(false);
+        let keyboard_running = input_guard_running();
         if !locked || !keyboard_guard_enabled {
             // Nothing to recover; reset the backoff state.
             failures = 0;
             backoff_until = None;
-        } else if !input_guard_running() {
+        } else if !keyboard_running {
             let backing_off = backoff_until.is_some_and(|until| Instant::now() < until);
             if !backing_off {
                 match recover_guard_from_watchdog(&core) {
@@ -3394,8 +3392,8 @@ fn stop_guard_agent(core: &ParoleCore) -> Result<(), String> {
         }
         let guard_result = stop_launchctl_target(&guard_target);
         stop_guard_processes();
-        // The watchdog is gone, so resume any VS Code agents it had paused —
-        // otherwise stopping the guard would leave them frozen.
+        // Legacy cleanup: older builds could pause VS Code agents, so stopping
+        // the guard should never leave those processes frozen.
         resume_vscode_agents(core);
         watchdog_result.and(guard_result)
     }
@@ -4678,13 +4676,11 @@ fn ensure_hook_marker(command: &str) -> String {
 // The Claude Code / Codex VS Code extensions do not fire the settings.json /
 // hooks.json prompt-submit hook (an upstream bug), so the hook layer can't gate
 // them. Instead we point each extension's "launch the agent process" setting at a
-// thin Prompt Parole shim. The shim:
-//   1. refuses to start the agent during curfew (blocks NEW sessions); and
-//   2. records its own PID (which becomes the agent's PID after exec) so the
-//      guard watchdog can SIGSTOP that exact process during curfew and SIGCONT it
-//      after — pausing an ALREADY-OPEN extension chat too.
-// Only agents launched through these wrappers are ever signalled, and only while
-// they are still a claude/codex process, so terminal sessions are never touched.
+// thin Prompt Parole shim. The shim refuses to start the agent during curfew,
+// which blocks new extension sessions. Already-open extension chats are left
+// running: the extensions do not expose a prompt hook, and Prompt Parole
+// deliberately does not pause running agents because that would hide or stall
+// progress the user is allowed to inspect.
 // ---------------------------------------------------------------------------
 
 const VSCODE_CLAUDE_SETTING: &str = "claudeCode.claudeProcessWrapper";
@@ -4694,8 +4690,7 @@ fn vscode_wrapper_dir(core: &ParoleCore) -> PathBuf {
     core.app_dir.join("vscode")
 }
 
-/// File listing the PIDs of agents launched by the VS Code wrappers (one per line),
-/// so the watchdog can suspend exactly those during curfew.
+/// User settings file that stores VS Code extension wrapper paths.
 fn vscode_user_settings_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "Could not find home directory.".to_owned())?;
     #[cfg(target_os = "macos")]
@@ -4707,9 +4702,8 @@ fn vscode_user_settings_path() -> Result<PathBuf, String> {
 
 /// Body that resolves the real agent and execs it. `$@` from Claude Code already
 /// starts with the bundled binary; Codex's cliExecutable IS the binary, so we
-/// resolve the latest bundled codex and exec it with the args. Suspension of
-/// already-open chats is handled by the watchdog via process ancestry, so this
-/// wrapper only needs to block *new* launches during curfew.
+/// resolve the latest bundled codex and exec it with the args. This wrapper only
+/// blocks *new* launches during curfew; already-open chats keep running.
 fn vscode_wrapper_script(prompt_parole_exe: &Path, exec_body: &str) -> String {
     // `check` exits 1 only when configured AND currently blocked; 0 (allowed) and 2
     // (unconfigured/error) both fall through to running the agent, matching Prompt
@@ -4761,37 +4755,20 @@ fn install_vscode_wrappers(core: &ParoleCore) -> Result<String, String> {
     );
     let backup = backup_file(&settings)?;
     write_json_shared(&settings, &data)?;
-    // Ensure the watchdog runs — it suspends already-open extension agents during
-    // curfew. (It needs no Accessibility permission, unlike the keyboard guard.)
-    let watchdog = start_vscode_watchdog(core);
     let restart = "Reload/restart VS Code so the extensions pick up the wrapper.";
-    let mut message = match backup {
+    let message = match backup {
         Some(path) => format!(
             "Configured VS Code Claude Code + Codex extensions. {restart} (settings backup: {})",
             path.display()
         ),
         None => format!("Configured VS Code Claude Code + Codex extensions. {restart}"),
     };
-    if let Err(err) = watchdog {
-        message.push_str(&format!(
-            " (note: could not start the background watcher that pauses open sessions: {err})"
-        ));
-    }
     Ok(message)
 }
 
-#[cfg(target_os = "macos")]
-fn start_vscode_watchdog(core: &ParoleCore) -> Result<(), String> {
-    start_guard_watchdog_agent(core)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn start_vscode_watchdog(_core: &ParoleCore) -> Result<(), String> {
-    Err("VS Code coverage is only available on macOS.".to_owned())
-}
-
 fn uninstall_vscode_wrappers(core: &ParoleCore) -> Result<String, String> {
-    // Resume any agents we paused, so removing coverage never leaves one frozen.
+    // Resume any agents paused by older Prompt Parole builds, so removing coverage
+    // never leaves one frozen.
     resume_vscode_agents(core);
     let dir = vscode_wrapper_dir(core);
     let settings = vscode_user_settings_path()?;
@@ -4925,30 +4902,8 @@ fn vscode_agent_pids() -> Vec<u32> {
     vscode_descendant_agents(&ps_snapshot())
 }
 
-fn vscode_coverage_installed(core: &ParoleCore) -> bool {
-    vscode_wrapper_configured(core, VSCODE_CLAUDE_SETTING)
-        || vscode_wrapper_configured(core, VSCODE_CODEX_SETTING)
-}
-
-/// SIGSTOP (curfew) or SIGCONT (otherwise) the VS-Code-launched extension agents.
-/// Ancestry is re-derived from a live `ps` each call, so exited PIDs are never
-/// signalled and there is no stale state to prune — and an already-open chat is
-/// paused even though it never ran through our wrapper. No-op unless VS Code
-/// coverage is installed, so a keyboard-guard-only user is never affected.
-fn manage_vscode_suspension(core: &ParoleCore, curfew_active: bool) {
-    if !vscode_coverage_installed(core) {
-        return;
-    }
-    let signal = if curfew_active { "-STOP" } else { "-CONT" };
-    for pid in vscode_agent_pids() {
-        let _ = Command::new("kill")
-            .args([signal, &pid.to_string()])
-            .status();
-    }
-}
-
-/// Resume (SIGCONT) every VS-Code-launched agent — used when coverage is removed
-/// or the guard is stopped, so we never leave an agent frozen.
+/// Resume (SIGCONT) every VS-Code-launched agent — used as a compatibility cleanup
+/// for agents that older builds may have paused.
 fn resume_vscode_agents(_core: &ParoleCore) {
     for pid in vscode_agent_pids() {
         let _ = Command::new("kill")
@@ -5616,7 +5571,7 @@ mod tests {
     }
 
     #[test]
-    fn vscode_suspension_targets_only_vscode_descended_agents() {
+    fn vscode_descendant_matcher_targets_only_vscode_agents() {
         // Synthetic process tree:
         //   1 launchd
         //   ├─ 10 Terminal.app ─ 11 zsh ─ 12 codex      (terminal: must NOT match)
@@ -5641,7 +5596,7 @@ mod tests {
     }
 
     #[test]
-    fn vscode_suspension_survives_a_parent_cycle() {
+    fn vscode_descendant_matcher_survives_a_parent_cycle() {
         // PID reuse could fabricate a cycle; the depth cap must stop the walk.
         let mut procs: HashMap<u32, (u32, String)> = HashMap::new();
         procs.insert(40, (41, "codex".into()));
@@ -5706,6 +5661,22 @@ mod tests {
         assert!(!should_block_guard_key(53, 0));
         assert!(!should_block_guard_key(123, 0));
         assert!(!should_block_guard_key(124, 0));
+    }
+
+    #[test]
+    fn locked_enforcement_does_not_stop_running_agents() {
+        let source = include_str!("main.rs");
+        for forbidden in [
+            ["-", "STOP"].concat(),
+            ["SIG", "STOP"].concat(),
+            ["manage", "_terminal", "_codex", "_pause"].concat(),
+            ["manage", "_vscode", "_suspension"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "locked enforcement must not stop running agents: found {forbidden}"
+            );
+        }
     }
 
     #[test]

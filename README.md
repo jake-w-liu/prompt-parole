@@ -214,11 +214,12 @@ prompt-parole guard-agent --action start
 ```
 
 The GUI's **Start Input Guard** button uses the same path. It installs a small
-watchdog LaunchAgent plus the keyboard guard. If macOS allows the guard from an
-interactive Terminal but denies the direct LaunchAgent event tap, Prompt Parole
-falls back to a visible Terminal guard process. During a locked period, the
-watchdog restarts that guard if it disappears, so a closed or crashed guard does
-not silently reopen prompting.
+watchdog LaunchAgent plus the keyboard guard. If macOS denies the direct
+LaunchAgent event tap, Prompt Parole reports the permission problem and the
+watchdog retries the headless guard after permission is granted. During a locked
+period, the watchdog restarts that guard if it disappears, so a closed or
+crashed guard does not silently reopen prompting. It does not pause or kill the
+running Codex/Claude process.
 
 ## Protection Layers
 
@@ -253,16 +254,11 @@ agent-launch settings to point at it:
 - Codex's (`openai.chatgpt`) `chatgpt.cliExecutable`
 
 During curfew the shim runs `prompt-parole check` and refuses to start the agent;
-outside curfew it execs the real agent unchanged. To also **pause a chat that was
-already open** when curfew began, the guard watchdog (started automatically by
-`install-vscode`) finds every `claude`/`codex` process that descends from VS Code
-— by walking the process tree, not by relying on the shim — and `SIGSTOP`s them
-while curfew is active, `SIGCONT`ing them when curfew ends or you unlock. Because
-the match is "descends from VS Code", terminal sessions (Terminal.app, iTerm) and
-your shell are never touched; only VS-Code-launched agents (extension chats and
-the integrated terminal) are signalled. Suspension needs no macOS permission. A
-paused chat may show a spinner until curfew ends. `uninstall-vscode` resumes any
-paused agents and removes the settings and shim.
+outside curfew it execs the real agent unchanged. Already-open VS Code extension
+chats are not paused: VS Code does not expose a prompt-submit hook for these
+extensions, and Prompt Parole does not stop running agents because that would
+also stop or hide the progress you are allowed to inspect. Reload/restart VS Code
+after installing coverage so new extension sessions use the shim.
 
 (Other AI extensions such as GitHub Copilot Chat cannot be gated this way; VS Code
 does not let one extension intercept another's prompts.)
