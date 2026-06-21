@@ -3307,8 +3307,16 @@ fn run_guard_watchdog(core: ParoleCore, interval_seconds: u64) -> Result<i32, St
     let mut backoff_until: Option<Instant> = None;
     loop {
         let locked = guard_curfew_active(&core);
-        if !locked {
-            // Outside curfew there is nothing to recover; reset the backoff state.
+        // Pause/resume already-open VS Code extension agents (no-op if VS Code
+        // coverage isn't installed — the PID list is empty).
+        manage_vscode_suspension(&core, locked);
+        // Only try to (re)start the keyboard event-tap guard if the user actually
+        // set it up; VS-Code-only users never started it, so don't churn on it.
+        let keyboard_guard_enabled = guard_agent_plist_path()
+            .map(|path| path.exists())
+            .unwrap_or(false);
+        if !locked || !keyboard_guard_enabled {
+            // Nothing to recover; reset the backoff state.
             failures = 0;
             backoff_until = None;
         } else if !input_guard_running() {
@@ -3365,7 +3373,6 @@ fn open_input_monitoring_settings() {
 fn stop_guard_agent(core: &ParoleCore) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let _ = core;
         let domain = launchctl_domain()?;
         let guard_target = launchctl_target(&domain, GUARD_AGENT_LABEL);
         let watchdog_target = launchctl_target(&domain, GUARD_WATCHDOG_LABEL);
@@ -3381,6 +3388,9 @@ fn stop_guard_agent(core: &ParoleCore) -> Result<(), String> {
         }
         let guard_result = stop_launchctl_target(&guard_target);
         stop_guard_processes();
+        // The watchdog is gone, so resume any VS Code agents it had paused —
+        // otherwise stopping the guard would leave them frozen.
+        resume_vscode_agents(core);
         watchdog_result.and(guard_result)
     }
     #[cfg(not(target_os = "macos"))]
@@ -4662,10 +4672,13 @@ fn ensure_hook_marker(command: &str) -> String {
 // The Claude Code / Codex VS Code extensions do not fire the settings.json /
 // hooks.json prompt-submit hook (an upstream bug), so the hook layer can't gate
 // them. Instead we point each extension's "launch the agent process" setting at a
-// thin Prompt Parole shim that runs `prompt-parole check` and refuses during
-// curfew, otherwise execs the real agent transparently. This blocks NEW agent
-// sessions in the extension during curfew (a session already open when curfew
-// starts keeps running until reload — same guarantee as the CLI launchers).
+// thin Prompt Parole shim. The shim:
+//   1. refuses to start the agent during curfew (blocks NEW sessions); and
+//   2. records its own PID (which becomes the agent's PID after exec) so the
+//      guard watchdog can SIGSTOP that exact process during curfew and SIGCONT it
+//      after — pausing an ALREADY-OPEN extension chat too.
+// Only agents launched through these wrappers are ever signalled, and only while
+// they are still a claude/codex process, so terminal sessions are never touched.
 // ---------------------------------------------------------------------------
 
 const VSCODE_CLAUDE_SETTING: &str = "claudeCode.claudeProcessWrapper";
@@ -4673,6 +4686,12 @@ const VSCODE_CODEX_SETTING: &str = "chatgpt.cliExecutable";
 
 fn vscode_wrapper_dir(core: &ParoleCore) -> PathBuf {
     core.app_dir.join("vscode")
+}
+
+/// File listing the PIDs of agents launched by the VS Code wrappers (one per line),
+/// so the watchdog can suspend exactly those during curfew.
+fn vscode_agents_file(core: &ParoleCore) -> PathBuf {
+    vscode_wrapper_dir(core).join("agents.pids")
 }
 
 fn vscode_user_settings_path() -> Result<PathBuf, String> {
@@ -4687,14 +4706,18 @@ fn vscode_user_settings_path() -> Result<PathBuf, String> {
 /// Body that resolves the real agent and execs it. `$@` from Claude Code already
 /// starts with the bundled binary; Codex's cliExecutable IS the binary, so we
 /// resolve the latest bundled codex and exec it with the args.
-fn vscode_wrapper_script(prompt_parole_exe: &Path, exec_body: &str) -> String {
+fn vscode_wrapper_script(prompt_parole_exe: &Path, pids_file: &Path, exec_body: &str) -> String {
     // `check` exits 1 only when configured AND currently blocked; 0 (allowed) and 2
     // (unconfigured/error) both fall through to running the agent, matching Prompt
-    // Parole's "unconfigured = allow" behavior.
+    // Parole's "unconfigured = allow" behavior. `$$` is recorded BEFORE exec, so the
+    // recorded PID is the agent's PID (exec keeps the same PID).
+    let dir = pids_file.parent().unwrap_or_else(|| Path::new("."));
     format!(
-        "#!/bin/sh\n# PROMPT_PAROLE_LAUNCHER=1\n# Managed by Prompt Parole — gates the VS Code agent during curfew.\n{} check >/dev/null 2>&1\nif [ \"$?\" -eq 1 ]; then\n  echo 'Prompt Parole: curfew is active — new sessions are blocked until your unlock window.' >&2\n  exit 1\nfi\n{}\n",
-        shell_quote(&prompt_parole_exe.to_string_lossy()),
-        exec_body,
+        "#!/bin/sh\n# PROMPT_PAROLE_LAUNCHER=1\n# Managed by Prompt Parole — gates the VS Code agent during curfew.\n{exe} check >/dev/null 2>&1\nif [ \"$?\" -eq 1 ]; then\n  echo 'Prompt Parole: curfew is active — new sessions are blocked until your unlock window.' >&2\n  exit 1\nfi\nmkdir -p {dir} 2>/dev/null\nprintf '%s\\n' \"$$\" >> {pids} 2>/dev/null\n{body}\n",
+        exe = shell_quote(&prompt_parole_exe.to_string_lossy()),
+        dir = shell_quote(&dir.to_string_lossy()),
+        pids = shell_quote(&pids_file.to_string_lossy()),
+        body = exec_body,
     )
 }
 
@@ -4714,14 +4737,20 @@ fn install_vscode_wrappers(core: &ParoleCore) -> Result<String, String> {
     let dir = vscode_wrapper_dir(core);
     ensure_private_dir(&dir)?;
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("prompt-parole"));
+    let pids = vscode_agents_file(core);
+    // Start the agent-PID list fresh.
+    let _ = fs::write(&pids, "");
     let claude_wrapper = dir.join("vscode-claude-wrapper.sh");
     let codex_wrapper = dir.join("vscode-codex-wrapper.sh");
     // Claude Code invokes: <wrapper> <bundled-binary> <args...> — exec passes through.
-    write_vscode_wrapper(&claude_wrapper, &vscode_wrapper_script(&exe, "exec \"$@\""))?;
+    write_vscode_wrapper(
+        &claude_wrapper,
+        &vscode_wrapper_script(&exe, &pids, "exec \"$@\""),
+    )?;
     // Codex (openai.chatgpt) treats cliExecutable AS codex, so resolve the bundled
     // codex (latest version) and exec it with the args.
     let codex_body = "real=$(ls -t \"$HOME\"/.vscode/extensions/openai.chatgpt-*/bin/*/codex 2>/dev/null | head -1)\n[ -n \"$real\" ] || real=codex\nexec \"$real\" \"$@\"";
-    write_vscode_wrapper(&codex_wrapper, &vscode_wrapper_script(&exe, codex_body))?;
+    write_vscode_wrapper(&codex_wrapper, &vscode_wrapper_script(&exe, &pids, codex_body))?;
 
     let settings = vscode_user_settings_path()?;
     let mut data = load_vscode_settings(&settings)?;
@@ -4738,17 +4767,38 @@ fn install_vscode_wrappers(core: &ParoleCore) -> Result<String, String> {
     );
     let backup = backup_file(&settings)?;
     write_json_shared(&settings, &data)?;
+    // Ensure the watchdog runs — it suspends already-open extension agents during
+    // curfew. (It needs no Accessibility permission, unlike the keyboard guard.)
+    let watchdog = start_vscode_watchdog(core);
     let restart = "Reload/restart VS Code so the extensions pick up the wrapper.";
-    Ok(match backup {
+    let mut message = match backup {
         Some(path) => format!(
             "Configured VS Code Claude Code + Codex extensions. {restart} (settings backup: {})",
             path.display()
         ),
         None => format!("Configured VS Code Claude Code + Codex extensions. {restart}"),
-    })
+    };
+    if let Err(err) = watchdog {
+        message.push_str(&format!(
+            " (note: could not start the background watcher that pauses open sessions: {err})"
+        ));
+    }
+    Ok(message)
+}
+
+#[cfg(target_os = "macos")]
+fn start_vscode_watchdog(core: &ParoleCore) -> Result<(), String> {
+    start_guard_watchdog_agent(core)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn start_vscode_watchdog(_core: &ParoleCore) -> Result<(), String> {
+    Err("VS Code coverage is only available on macOS.".to_owned())
 }
 
 fn uninstall_vscode_wrappers(core: &ParoleCore) -> Result<String, String> {
+    // Resume any agents we paused, so removing coverage never leaves one frozen.
+    resume_vscode_agents(core);
     let dir = vscode_wrapper_dir(core);
     let settings = vscode_user_settings_path()?;
     let mut removed = 0;
@@ -4806,6 +4856,76 @@ fn vscode_wrapper_configured(core: &ParoleCore, key: &str) -> bool {
                 .map(|value| Path::new(value).starts_with(&dir))
         })
         .unwrap_or(false)
+}
+
+fn read_vscode_agent_pids(core: &ParoleCore) -> Vec<u32> {
+    let mut pids: Vec<u32> = fs::read_to_string(vscode_agents_file(core))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn write_vscode_agent_pids(core: &ParoleCore, pids: &[u32]) {
+    let body = pids
+        .iter()
+        .map(|pid| pid.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = fs::write(vscode_agents_file(core), body);
+}
+
+/// True if `pid` is currently a live claude/codex process. Guards SIGSTOP/SIGCONT
+/// against PID reuse — we only ever signal a PID that is still an agent.
+fn pid_is_agent_process(pid: u32) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let comm = String::from_utf8_lossy(&output.stdout);
+    let name = Path::new(comm.trim())
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name.contains("claude") || name.contains("codex")
+}
+
+/// SIGSTOP (curfew) or SIGCONT (otherwise) the VS Code extension agents we
+/// launched, pruning PIDs that have exited or are no longer agent processes.
+fn manage_vscode_suspension(core: &ParoleCore, curfew_active: bool) {
+    let signal = if curfew_active { "-STOP" } else { "-CONT" };
+    let mut live = Vec::new();
+    for pid in read_vscode_agent_pids(core) {
+        if !pid_is_agent_process(pid) {
+            continue; // exited or PID reused by a non-agent — drop and never signal it
+        }
+        live.push(pid);
+        let _ = Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status();
+    }
+    write_vscode_agent_pids(core, &live);
+}
+
+/// Resume (SIGCONT) every tracked agent — used when coverage is removed or the
+/// guard is stopped, so we never leave an agent frozen.
+fn resume_vscode_agents(core: &ParoleCore) {
+    for pid in read_vscode_agent_pids(core) {
+        if pid_is_agent_process(pid) {
+            let _ = Command::new("kill")
+                .args(["-CONT", &pid.to_string()])
+                .status();
+        }
+    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -5457,13 +5577,28 @@ mod tests {
     }
 
     #[test]
-    fn vscode_wrapper_gates_on_curfew_and_is_marked() {
-        let script = vscode_wrapper_script(Path::new("/tmp/prompt-parole"), "exec \"$@\"");
-        // It must be recognizable as ours, gate via `check`, and pass through otherwise.
+    fn vscode_wrapper_gates_on_curfew_records_pid_and_is_marked() {
+        let pids = Path::new("/tmp/pp/vscode/agents.pids");
+        let script = vscode_wrapper_script(Path::new("/tmp/prompt-parole"), pids, "exec \"$@\"");
+        // Recognizable as ours, gates via `check`, records its PID, passes through.
         assert!(script.contains("PROMPT_PAROLE_LAUNCHER=1"));
         assert!(script.contains("/tmp/prompt-parole check"));
         assert!(script.contains("exit 1"));
+        assert!(script.contains("\"$$\" >> /tmp/pp/vscode/agents.pids"));
         assert!(script.contains("exec \"$@\""));
+    }
+
+    #[test]
+    fn vscode_agent_pid_list_round_trips_and_dedups() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = ParoleCore {
+            app_dir: dir.path().to_path_buf(),
+        };
+        fs::create_dir_all(vscode_wrapper_dir(&core)).unwrap();
+        fs::write(vscode_agents_file(&core), "100\n200\n100\n\nbad\n300\n").unwrap();
+        assert_eq!(read_vscode_agent_pids(&core), vec![100, 200, 300]);
+        write_vscode_agent_pids(&core, &[42, 7]);
+        assert_eq!(read_vscode_agent_pids(&core), vec![7, 42]);
     }
 
     #[test]

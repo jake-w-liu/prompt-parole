@@ -253,11 +253,17 @@ agent-launch settings to point at it:
 - Codex's (`openai.chatgpt`) `chatgpt.cliExecutable`
 
 During curfew the shim runs `prompt-parole check` and refuses to start the agent;
-outside curfew it execs the real agent unchanged. Like the launch wrappers, this
-blocks **new** agent sessions during curfew — a chat session already open when
-curfew begins keeps working until VS Code is reloaded. `uninstall-vscode` removes
-the settings and shim. (Other AI extensions such as GitHub Copilot Chat cannot be
-gated this way; VS Code does not let one extension intercept another's prompts.)
+outside curfew it execs the real agent unchanged. The shim also records the
+agent's PID, so the guard watchdog (started automatically by `install-vscode`)
+can **pause an already-open chat too**: when curfew is active it `SIGSTOP`s those
+agent processes, and `SIGCONT`s them when curfew ends or you unlock. Only agents
+launched through these shims are ever signalled — and only while they are still a
+claude/codex process — so terminal sessions are never touched. A paused chat may
+show a spinner until curfew ends. `uninstall-vscode` resumes any paused agents
+and removes the settings and shim.
+
+(Other AI extensions such as GitHub Copilot Chat cannot be gated this way; VS Code
+does not let one extension intercept another's prompts.)
 
 ## Security Model
 
