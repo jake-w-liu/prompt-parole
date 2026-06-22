@@ -4753,9 +4753,25 @@ fn run_agent_pty_proxy(
         .map_err(|err| format!("Could not write protected terminal input: {err}"))?;
 
     let output_thread = thread::spawn(move || {
-        let mut stdout = std::io::stdout().lock();
-        let _ = std::io::copy(&mut reader, &mut stdout);
-        let _ = stdout.flush();
+        // Pump child output straight to fd 1, byte for byte. Do NOT route this through
+        // std::io::stdout(): that is a LineWriter, so it withholds every byte after the
+        // last '\n' until a newline arrives or its ~1KB buffer fills. TUI agents
+        // (claude/codex) redraw with newline-free escape sequences and echo keystrokes
+        // the same way, so a line buffer makes typed characters and screen updates
+        // appear seconds late. A PTY proxy must be byte-transparent in both directions.
+        let mut buf = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if write_all_stdout_raw(&buf[..read]).is_err() {
+                        break;
+                    }
+                }
+                Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
     });
 
     let done = Arc::new(AtomicBool::new(false));
@@ -4868,6 +4884,31 @@ fn poll_stdin_chunk(buf: &mut [u8], timeout_millis: i32) -> Result<Option<usize>
         }
         return Ok(Some(read as usize));
     }
+}
+
+#[cfg(unix)]
+fn write_all_stdout_raw(mut bytes: &[u8]) -> Result<(), std::io::Error> {
+    while !bytes.is_empty() {
+        // SAFETY: `bytes` is a valid readable slice of `bytes.len()` bytes.
+        let written = unsafe {
+            libc::write(
+                libc::STDOUT_FILENO,
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+            )
+        };
+        if written < 0 {
+            let err = std::io::Error::last_os_error();
+            // fd 1 is the user's blocking tty, so EAGAIN is not expected; retry the
+            // interrupt cases rather than dropping output mid-write.
+            if matches!(err.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
+                continue;
+            }
+            return Err(err);
+        }
+        bytes = &bytes[written as usize..];
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
