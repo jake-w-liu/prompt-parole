@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
@@ -956,6 +956,10 @@ enum AppEvent {
     /// Periodic live refresh of lock status and protection (never touches the
     /// editable fields the user may be mid-edit on).
     Refresh {
+        /// Value of `action_epoch` when this refresh was snapshotted. The pump rejects
+        /// the refresh if an action has completed since (the epoch advanced), so a slow
+        /// pre-action snapshot can't clobber a fresh post-action state in a later batch.
+        epoch: u64,
         configured: bool,
         status: Option<StatusPayload>,
         protection: ProtectionStatus,
@@ -989,6 +993,9 @@ struct PromptParoleApp {
     protection: ProtectionStatus,
     active_tab: AppTab,
     busy: Option<String>,
+    /// Monotonic counter bumped each time an action settles; lets the pump reject a
+    /// background refresh that was snapshotted before a since-completed action.
+    action_epoch: Arc<AtomicU64>,
     events_tx: mpsc::Sender<AppEvent>,
     events_rx: mpsc::Receiver<AppEvent>,
     refresher_started: bool,
@@ -1024,6 +1031,7 @@ impl PromptParoleApp {
             protection: ProtectionStatus::default(),
             active_tab: initial_app_tab(),
             busy: None,
+            action_epoch: Arc::new(AtomicU64::new(0)),
             events_tx,
             events_rx,
             refresher_started: false,
@@ -1089,13 +1097,18 @@ impl PromptParoleApp {
             let tx = self.events_tx.clone();
             let core = self.core.clone();
             let ctx = ctx.clone();
+            let action_epoch = Arc::clone(&self.action_epoch);
             thread::spawn(move || {
                 loop {
+                    // Capture the epoch BEFORE the (slow) snapshot so the pump can reject
+                    // this refresh if an action completes while we are computing it.
+                    let epoch = action_epoch.load(Ordering::SeqCst);
                     let configured = core.is_configured();
                     let status = if configured { core.status().ok() } else { None };
                     let protection = protection_status();
                     if tx
                         .send(AppEvent::Refresh {
+                            epoch,
                             configured,
                             status,
                             protection,
@@ -1123,13 +1136,19 @@ impl PromptParoleApp {
         for event in events {
             match event {
                 AppEvent::Refresh {
+                    epoch,
                     configured,
                     status,
                     protection,
                 } => {
-                    // Skip background refreshes while an action is settling (or one
-                    // completed this batch) so they cannot clobber its fresh state.
-                    if self.busy.is_none() && !has_action {
+                    // Skip background refreshes that are stale: while an action is
+                    // settling, one completed this batch, OR one completed since this
+                    // refresh was snapshotted (the epoch advanced). The epoch check
+                    // closes the cross-batch window the busy/has_action gates miss.
+                    if self.busy.is_none()
+                        && !has_action
+                        && epoch == self.action_epoch.load(Ordering::SeqCst)
+                    {
                         self.configured = configured;
                         self.status = status;
                         self.protection = protection;
@@ -1183,6 +1202,7 @@ impl PromptParoleApp {
         let core = self.core.clone();
         let tx = self.events_tx.clone();
         let ctx = ctx.clone();
+        let action_epoch = Arc::clone(&self.action_epoch);
         thread::spawn(move || {
             // Catch a panic in the job so the UI's busy flag always clears; a stuck
             // busy flag would disable the whole window permanently.
@@ -1192,6 +1212,9 @@ impl PromptParoleApp {
             let config = core.load_config().unwrap_or_else(|_| default_config());
             let status = if configured { core.status().ok() } else { None };
             let protection = protection_status();
+            // Bump the epoch (after the fresh snapshot, before sending) so any refresh
+            // snapshotted before this action is rejected by the pump as stale.
+            action_epoch.fetch_add(1, Ordering::SeqCst);
             let _ = tx.send(AppEvent::ActionDone {
                 outcome,
                 configured,
@@ -4949,31 +4972,39 @@ fn run_agent_pty_proxy(
     // instead of portable-pty's lossy collapse to exit code 1. std::process::Child
     // (what spawn_command returns) has a no-op Drop, so reaping its pid directly is
     // safe and never double-waits.
-    let code = 'wait: loop {
-        if let Some(pid) = child_pid {
-            let mut raw: libc::c_int = 0;
-            loop {
-                let r = unsafe { libc::waitpid(pid as i32, &mut raw, 0) };
-                if r == -1 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::EINTR) {
-                        continue;
-                    }
-                    break; // ECHILD/other: fall back to portable-pty's wait below
+    let mut reaped: Option<i32> = None;
+    if let Some(pid) = child_pid {
+        let mut raw: libc::c_int = 0;
+        loop {
+            let r = unsafe { libc::waitpid(pid as i32, &mut raw, 0) };
+            if r == -1 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
                 }
-                if libc::WIFEXITED(raw) {
-                    break 'wait libc::WEXITSTATUS(raw);
-                }
-                if libc::WIFSIGNALED(raw) {
-                    break 'wait 128 + libc::WTERMSIG(raw);
-                }
-                // Stopped/continued: keep waiting for a terminal state.
+                break; // ECHILD/other: fall back to portable-pty's wait below.
             }
+            if libc::WIFEXITED(raw) {
+                reaped = Some(libc::WEXITSTATUS(raw));
+                break;
+            }
+            if libc::WIFSIGNALED(raw) {
+                reaped = Some(128 + libc::WTERMSIG(raw));
+                break;
+            }
+            // Stopped/continued: keep waiting for a terminal state.
         }
-        let status = child
-            .wait()
-            .map_err(|err| format!("Could not wait for {}: {err}", real.display()))?;
-        break 'wait status.exit_code().min(i32::MAX as u32) as i32;
+    }
+    let code = match reaped {
+        Some(code) => code,
+        // No pid, or waitpid failed: fall back to portable-pty's wait (which loses the
+        // numeric signal, collapsing it to exit code 1).
+        None => {
+            let status = child
+                .wait()
+                .map_err(|err| format!("Could not wait for {}: {err}", real.display()))?;
+            status.exit_code().min(i32::MAX as u32) as i32
+        }
     };
 
     done.store(true, Ordering::Relaxed);
