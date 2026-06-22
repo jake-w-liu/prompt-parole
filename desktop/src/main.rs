@@ -4735,6 +4735,13 @@ fn run_agent_pty_proxy(
         .map_err(|err| format!("Could not create protected terminal for {agent}: {err}"))?;
     let mut cmd = CommandBuilder::new(real.as_os_str());
     cmd.args(args.iter().map(String::as_str));
+    // portable-pty defaults the child's working directory to $HOME when cwd is
+    // unset (CommandBuilder::as_command -> get_home_dir), so without this every
+    // proxied agent would start in the home dir instead of where it was launched.
+    // This must hold regardless of curfew; curfew only gates stdin, below.
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
     let mut child = pair.slave.spawn_command(cmd).map_err(|err| {
         format!(
             "Could not launch {} in protected terminal: {err}",
