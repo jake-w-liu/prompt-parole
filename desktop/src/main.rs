@@ -709,13 +709,51 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
 /// Write into a config file we do not own (e.g. ~/.claude/settings.json) without
 /// tightening the directory or the file's existing permissions.
 fn write_json_shared<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let parent = path
+    // If the destination is a symlink (common when settings.json/hooks.json are
+    // managed by a dotfiles tool like stow/chezmoi/yadm), write THROUGH it to the real
+    // target. Otherwise the atomic rename below would replace the symlink with a plain
+    // file and silently detach the tracked config.
+    let resolved = resolve_symlink_target(path);
+    let target = resolved.as_deref().unwrap_or(path);
+    let parent = target
         .parent()
-        .ok_or_else(|| format!("{} has no parent directory.", path.display()))?;
+        .ok_or_else(|| format!("{} has no parent directory.", target.display()))?;
     fs::create_dir_all(parent)
         .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
-    let preserve = existing_file_mode(path);
-    persist_json_atomic(path, parent, value, preserve)
+    let preserve = existing_file_mode(target);
+    persist_json_atomic(target, parent, value, preserve)
+}
+
+/// If `path` is a symlink, follow the chain to the final target path (which may not
+/// exist yet) so shared-config writers replace the target file rather than clobbering
+/// the link. Returns None when `path` is not a symlink or a cycle/too-deep chain is hit
+/// (in which case the caller falls back to treating `path` as the destination).
+fn resolve_symlink_target(path: &Path) -> Option<PathBuf> {
+    if !fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut current = path.to_path_buf();
+    // Bounded so a symlink cycle cannot spin forever.
+    for _ in 0..40 {
+        let link = fs::read_link(&current).ok()?;
+        let resolved = if link.is_absolute() {
+            link
+        } else {
+            match current.parent() {
+                Some(parent) => parent.join(link),
+                None => link,
+            }
+        };
+        match fs::symlink_metadata(&resolved) {
+            Ok(m) if m.file_type().is_symlink() => current = resolved,
+            // Final target: a non-symlink that exists, or a path that doesn't exist yet.
+            _ => return Some(resolved),
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -1214,7 +1252,7 @@ impl PromptParoleApp {
         let minutes = self.unlock_request_minutes;
         self.spawn_action(ctx, "Unlocking…", false, move |core| {
             core.unlock(&password, minutes)
-                .map(|expires| format!("Unlocked until {}.", expires.format("%H:%M")))
+                .map(|expires| format!("Unlocked until {}.", expires.format("%Y-%m-%d %H:%M %Z")))
         });
     }
 
@@ -2679,6 +2717,21 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             Ok(0)
         }
         CommandKind::Check { json } => {
+            // Unconfigured = allow (exit 0). A genuine status/config-load error must NOT
+            // silently allow: it propagates as Err -> exit 2, and the launcher wrappers
+            // treat any non-zero exit as "block", so a corrupt config fails CLOSED like
+            // every other enforcement path (hook, guard, launch).
+            if !core.is_configured() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"allowed": true, "reason": "Prompt Parole is not configured."})
+                    );
+                } else {
+                    println!("allowed");
+                }
+                return Ok(0);
+            }
             let status = core.status()?;
             if json {
                 println!(
@@ -3132,6 +3185,12 @@ fn current_window_is_target() -> bool {
     if window_is_agent_target(&window.owner, &window.title) {
         return true;
     }
+    // Process-tree fallback for terminals whose title does NOT surface the agent.
+    // A terminal emulator shares ONE owner pid across all its windows/tabs, and there
+    // is no reliable window/tab -> child-process mapping, so this can also block a
+    // sibling shell window of the same app during curfew. That over-block is the
+    // deliberate fail-SAFE direction: narrowing it (e.g. by window number) would risk
+    // letting an agent prompt through during a focus switch, which defeats the curfew.
     let tree_pid = FOCUS_TARGET_PID.load(Ordering::Relaxed);
     window.pid > 0 && window.pid == tree_pid
 }
@@ -4487,11 +4546,15 @@ fn install_macos_app_bundle(app_dir: Option<&Path>) -> Result<PathBuf, String> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))
-                .map_err(|err| format!("Could not make {} executable: {err}", staging.display()))?;
+            fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).map_err(|err| {
+                let _ = fs::remove_file(&staging);
+                format!("Could not make {} executable: {err}", staging.display())
+            })?;
         }
-        fs::rename(&staging, &bundled_exe)
-            .map_err(|err| format!("Could not install {}: {err}", bundled_exe.display()))?;
+        fs::rename(&staging, &bundled_exe).map_err(|err| {
+            let _ = fs::remove_file(&staging);
+            format!("Could not install {}: {err}", bundled_exe.display())
+        })?;
         // Re-establish a valid ad-hoc signature for the freshly written bytes, so
         // the binary is not killed for a signature mismatch.
         adhoc_codesign(&bundled_exe)?;
@@ -4531,18 +4594,23 @@ fn install_app_icon(resources: &Path) -> Result<(), String> {
         ("icon_512x512.png", 512),
         ("icon_512x512@2x.png", 1024),
     ];
-    for (name, size) in ENTRIES {
-        write_icon_png(&iconset.join(name), size)?;
-    }
     let icns = resources.join("AppIcon.icns");
-    let output = Command::new("iconutil")
-        .args(["-c", "icns"])
-        .arg(&iconset)
-        .arg("-o")
-        .arg(&icns)
-        .output()
-        .map_err(|err| format!("Could not run iconutil: {err}"))?;
+    // Render + pack inside a closure so the staging iconset is removed on EVERY exit
+    // path, including a write_icon_png error or an iconutil spawn failure.
+    let render = (|| -> Result<std::process::Output, String> {
+        for (name, size) in ENTRIES {
+            write_icon_png(&iconset.join(name), size)?;
+        }
+        Command::new("iconutil")
+            .args(["-c", "icns"])
+            .arg(&iconset)
+            .arg("-o")
+            .arg(&icns)
+            .output()
+            .map_err(|err| format!("Could not run iconutil: {err}"))
+    })();
     let _ = fs::remove_dir_all(&iconset);
+    let output = render?;
     if !output.status.success() {
         return Err(format!(
             "iconutil failed: {}",
@@ -4710,7 +4778,19 @@ fn run_agent_direct(real: &Path, args: &[String]) -> Result<i32, String> {
         .args(args)
         .status()
         .map_err(|err| format!("Could not launch {}: {err}", real.display()))?;
-    Ok(status.code().unwrap_or(1))
+    // Report a signal death as 128+signal (POSIX shell convention) so callers can
+    // distinguish a crash from an ordinary exit(1).
+    Ok(status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal().map(|sig| 128 + sig).unwrap_or(1)
+        }
+        #[cfg(not(unix))]
+        {
+            1
+        }
+    }))
 }
 
 #[cfg(unix)]
@@ -4728,6 +4808,16 @@ fn run_agent_pty_proxy(
              Prompt Parole will not start an unprotected interactive session."
         )
     })?;
+
+    // portable-pty and std assume fd 1 is blocking; some parents (e.g. Node) leave
+    // O_NONBLOCK set on an inherited tty, which would make write_all_stdout_raw spin
+    // at 100% CPU on EAGAIN. Restore the blocking invariant once, best-effort.
+    unsafe {
+        let flags = libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL);
+        if flags != -1 && (flags & libc::O_NONBLOCK) != 0 {
+            libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -4759,6 +4849,17 @@ fn run_agent_pty_proxy(
         .take_writer()
         .map_err(|err| format!("Could not write protected terminal input: {err}"))?;
 
+    // Capture the agent pid before spawning the pumps: the output thread uses it to
+    // hang up a child that would otherwise block on a full PTY buffer, and we reap it
+    // ourselves below to recover the real exit/signal code.
+    let child_pid = child.process_id();
+
+    let done = Arc::new(AtomicBool::new(false));
+    // Set when the output pump actually exits, so shutdown can flush every byte (join)
+    // in the common case yet detach (never hang) if a grandchild holds the slave open.
+    let output_finished = Arc::new(AtomicBool::new(false));
+    let output_done = Arc::clone(&done);
+    let output_finished_flag = Arc::clone(&output_finished);
     let output_thread = thread::spawn(move || {
         // Pump child output straight to fd 1, byte for byte. Do NOT route this through
         // std::io::stdout(): that is a LineWriter, so it withholds every byte after the
@@ -4772,6 +4873,14 @@ fn run_agent_pty_proxy(
                 Ok(0) => break,
                 Ok(read) => {
                     if write_all_stdout_raw(&buf[..read]).is_err() {
+                        // fd 1 is gone; nothing will drain the PTY, so a child that
+                        // fills the kernel buffer would block forever. Hang up the
+                        // agent so its wait() can return.
+                        if let Some(pid) = child_pid {
+                            unsafe {
+                                libc::kill(pid as i32, libc::SIGHUP);
+                            }
+                        }
                         break;
                     }
                 }
@@ -4779,9 +4888,12 @@ fn run_agent_pty_proxy(
                 Err(_) => break,
             }
         }
+        // Let the input/resize threads stop spinning even if the agent outlives fd 1,
+        // and signal the shutdown path that all output has been drained.
+        output_done.store(true, Ordering::Relaxed);
+        output_finished_flag.store(true, Ordering::Relaxed);
     });
 
-    let done = Arc::new(AtomicBool::new(false));
     let resize_done = Arc::clone(&done);
     let master = pair.master;
     let resize_thread = thread::spawn(move || {
@@ -4833,19 +4945,58 @@ fn run_agent_pty_proxy(
         }
     });
 
-    let status = child
-        .wait()
-        .map_err(|err| format!("Could not wait for {}: {err}", real.display()))?;
+    // Reap the agent ourselves so a signal death reports the POSIX 128+signal code
+    // instead of portable-pty's lossy collapse to exit code 1. std::process::Child
+    // (what spawn_command returns) has a no-op Drop, so reaping its pid directly is
+    // safe and never double-waits.
+    let code = 'wait: loop {
+        if let Some(pid) = child_pid {
+            let mut raw: libc::c_int = 0;
+            loop {
+                let r = unsafe { libc::waitpid(pid as i32, &mut raw, 0) };
+                if r == -1 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break; // ECHILD/other: fall back to portable-pty's wait below
+                }
+                if libc::WIFEXITED(raw) {
+                    break 'wait libc::WEXITSTATUS(raw);
+                }
+                if libc::WIFSIGNALED(raw) {
+                    break 'wait 128 + libc::WTERMSIG(raw);
+                }
+                // Stopped/continued: keep waiting for a terminal state.
+            }
+        }
+        let status = child
+            .wait()
+            .map_err(|err| format!("Could not wait for {}: {err}", real.display()))?;
+        break 'wait status.exit_code().min(i32::MAX as u32) as i32;
+    };
+
     done.store(true, Ordering::Relaxed);
     let _ = input_thread.join();
     let _ = resize_thread.join();
-    let _ = output_thread.join();
-    let code = status.exit_code();
-    Ok(if code > i32::MAX as u32 {
-        1
+    // Flush remaining output. In the common case the master hits EOF right after the
+    // agent closes the slave, so output_finished flips within milliseconds and we join
+    // to write every last byte. If a detached grandchild (MCP/language server, node,
+    // ripgrep) keeps the slave open, the master never EOFs; after a short grace we
+    // DETACH instead of joining, so the terminal is never left hung in raw mode.
+    let grace = std::time::Instant::now();
+    while !output_finished.load(Ordering::Relaxed)
+        && grace.elapsed() < StdDuration::from_millis(1000)
+    {
+        thread::sleep(StdDuration::from_millis(5));
+    }
+    if output_finished.load(Ordering::Relaxed) {
+        let _ = output_thread.join();
     } else {
-        code as i32
-    })
+        // Detached; the blocked reader is reaped when the process exits a moment later.
+        drop(output_thread);
+    }
+    Ok(code)
 }
 
 #[cfg(unix)]
@@ -4906,12 +5057,25 @@ fn write_all_stdout_raw(mut bytes: &[u8]) -> Result<(), std::io::Error> {
         };
         if written < 0 {
             let err = std::io::Error::last_os_error();
-            // fd 1 is the user's blocking tty, so EAGAIN is not expected; retry the
-            // interrupt cases rather than dropping output mid-write.
-            if matches!(err.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
-                continue;
+            match err.raw_os_error() {
+                // Interrupted before any byte moved: retry immediately.
+                Some(libc::EINTR) => continue,
+                // fd 1 is non-blocking (an inherited O_NONBLOCK we could not clear):
+                // wait for it to become writable instead of spinning on EAGAIN.
+                Some(libc::EAGAIN) => {
+                    let mut poll_fd = libc::pollfd {
+                        fd: libc::STDOUT_FILENO,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: one valid pollfd; an infinite timeout blocks until drain.
+                    unsafe {
+                        libc::poll(&mut poll_fd, 1, -1);
+                    }
+                    continue;
+                }
+                _ => return Err(err),
             }
-            return Err(err);
         }
         bytes = &bytes[written as usize..];
     }
@@ -5152,11 +5316,12 @@ fn vscode_user_settings_path() -> Result<PathBuf, String> {
 /// cliExecutable IS the binary, so we resolve the latest bundled codex and proxy
 /// it with the args.
 fn vscode_wrapper_script(prompt_parole_exe: &Path, exec_body: &str) -> String {
-    // `check` exits 1 only when configured AND currently blocked; 0 (allowed) and 2
-    // (unconfigured/error) both fall through to running the agent, matching Prompt
-    // Parole's "unconfigured = allow" behavior.
+    // `check` exits 0 only when prompts are allowed (which now includes the
+    // unconfigured case). Any non-zero exit blocks: 1 = curfew active, 2 = status/
+    // config-load error. Blocking on non-zero makes a corrupt config fail CLOSED,
+    // matching the hook/guard/launch paths instead of silently allowing new sessions.
     format!(
-        "#!/bin/sh\n# PROMPT_PAROLE_LAUNCHER=1\n# Managed by Prompt Parole — gates the VS Code agent during curfew.\n{exe} check >/dev/null 2>&1\nif [ \"$?\" -eq 1 ]; then\n  echo 'Prompt Parole: curfew is active — new sessions are blocked until your unlock window.' >&2\n  exit 1\nfi\n{body}\n",
+        "#!/bin/sh\n# PROMPT_PAROLE_LAUNCHER=1\n# Managed by Prompt Parole — gates the VS Code agent during curfew.\n{exe} check >/dev/null 2>&1\nif [ \"$?\" -ne 0 ]; then\n  echo 'Prompt Parole: curfew is active or status is unavailable — new sessions are blocked until your unlock window.' >&2\n  exit 1\nfi\n{body}\n",
         exe = shell_quote(&prompt_parole_exe.to_string_lossy()),
         body = exec_body,
     )
@@ -5226,28 +5391,42 @@ fn uninstall_vscode_wrappers(core: &ParoleCore) -> Result<String, String> {
     let dir = vscode_wrapper_dir(core);
     let settings = vscode_user_settings_path()?;
     let mut removed = 0;
+    let mut manual_note = String::new();
     if settings.exists() {
-        let mut data = load_vscode_settings(&settings)?;
-        if let Some(object) = data.as_object_mut() {
-            for key in [VSCODE_CLAUDE_SETTING, VSCODE_CODEX_SETTING] {
-                // Only remove the key if it still points at one of our wrappers.
-                let ours = object
-                    .get(key)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| Path::new(value).starts_with(&dir));
-                if ours {
-                    object.remove(key);
-                    removed += 1;
+        match load_vscode_settings(&settings) {
+            Ok(mut data) => {
+                if let Some(object) = data.as_object_mut() {
+                    for key in [VSCODE_CLAUDE_SETTING, VSCODE_CODEX_SETTING] {
+                        // Only remove the key if it still points at one of our wrappers.
+                        let ours = object
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| Path::new(value).starts_with(&dir));
+                        if ours {
+                            object.remove(key);
+                            removed += 1;
+                        }
+                    }
+                }
+                if removed > 0 {
+                    let _ = backup_file(&settings)?;
+                    write_json_shared(&settings, &data)?;
                 }
             }
-        }
-        if removed > 0 {
-            let _ = backup_file(&settings)?;
-            write_json_shared(&settings, &data)?;
+            // A JSONC settings.json (comments / trailing commas) must NOT block teardown:
+            // still remove the wrapper scripts and tell the user which keys to delete.
+            Err(_) => {
+                manual_note = format!(
+                    " Could not parse {} — remove these keys by hand: \"{VSCODE_CLAUDE_SETTING}\" and \"{VSCODE_CODEX_SETTING}\".",
+                    settings.display()
+                );
+            }
         }
     }
     let _ = fs::remove_dir_all(&dir);
-    Ok(format!("Removed VS Code coverage ({removed} setting(s))."))
+    Ok(format!(
+        "Removed VS Code coverage ({removed} setting(s)).{manual_note}"
+    ))
 }
 
 /// Load VS Code settings.json, with a clearer error for the common JSONC case
@@ -5258,6 +5437,9 @@ fn load_vscode_settings(path: &Path) -> Result<serde_json::Value, String> {
     }
     let raw = fs::read_to_string(path)
         .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
     serde_json::from_str(&raw).map_err(|err| {
         format!(
             "Could not parse {} ({err}). If it contains comments or trailing commas, add these keys \
@@ -5427,6 +5609,11 @@ fn load_json_object(path: &Path) -> Result<serde_json::Value, String> {
     }
     let raw = fs::read_to_string(path)
         .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
+    // An existing-but-empty/whitespace file (interrupted writer, manual clear, a tool
+    // that touched the path) is a recoverable empty object, not a fatal parse error.
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
     let value: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|err| format!("{} is not valid JSON: {err}", path.display()))?;
     if !value.is_object() {
@@ -6459,5 +6646,64 @@ mod tests {
         assert_eq!(enji(), egui::Color32::from_rgb(159, 53, 58)); // #9F353A
         assert_eq!(sumi(), egui::Color32::from_rgb(28, 28, 28)); // #1C1C1C
         assert_eq!(nibi(), egui::Color32::from_rgb(101, 103, 101)); // #656765
+    }
+
+    #[test]
+    fn load_json_object_treats_empty_file_as_empty_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Existing-but-empty and whitespace-only files must not abort install/uninstall.
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(load_json_object(&path).unwrap(), serde_json::json!({}));
+        std::fs::write(&path, "  \n\t ").unwrap();
+        assert_eq!(load_json_object(&path).unwrap(), serde_json::json!({}));
+        // A non-existent file is still the empty object.
+        assert_eq!(
+            load_json_object(&dir.path().join("nope.json")).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_json_shared_writes_through_a_symlinked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real-settings.json");
+        std::fs::write(&target, "{}").unwrap();
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // resolve_symlink_target follows the link to the real file; a regular file -> None.
+        assert_eq!(
+            resolve_symlink_target(&link).as_deref(),
+            Some(target.as_path())
+        );
+        assert_eq!(resolve_symlink_target(&target), None);
+
+        // Writing through the link updates the TARGET and keeps the symlink intact, so a
+        // dotfiles-managed config keeps receiving changes instead of being detached.
+        write_json_shared(&link, &serde_json::json!({"k": 1})).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(written, serde_json::json!({"k": 1}));
+    }
+
+    #[test]
+    fn vscode_wrapper_fails_closed_on_check_error() {
+        let script = vscode_wrapper_script(
+            Path::new("/tmp/prompt-parole"),
+            "exec /tmp/prompt-parole proxy --agent codex --real codex -- \"$@\"",
+        );
+        // Any non-zero `check` exit (1 = curfew, 2 = status/config error) blocks, so a
+        // corrupt config cannot silently allow a new VS Code agent session.
+        assert!(script.contains("check >/dev/null 2>&1"));
+        assert!(script.contains("-ne 0"));
+        assert!(!script.contains("-eq 1"));
     }
 }
