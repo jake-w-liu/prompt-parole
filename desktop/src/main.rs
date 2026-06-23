@@ -205,8 +205,12 @@ impl ParoleCore {
             unlock_duration_minutes,
             password_required_for,
         )?;
-        write_json_atomic(&self.config_path(), &config)?;
+        // Write the secret FIRST: `is_configured()` keys on its existence, and a
+        // missing config.json falls back to the default (active) curfew. So if we
+        // crash mid-setup the tool is left configured-and-locked (fail closed) rather
+        // than secret-less and wide open. State defaults to locked, so write it last.
         write_json_atomic(&self.secret_path(), &secret)?;
+        write_json_atomic(&self.config_path(), &config)?;
         let state = State {
             version: 1,
             unlock_expires_at: None,
@@ -361,6 +365,36 @@ fn normalized_hook_agent(agent: &str) -> Result<&'static str, String> {
         "claude" | "claude-code" => Ok("claude-code"),
         _ => Err(format!("Unsupported agent {agent:?}.")),
     }
+}
+
+/// The curfew blocks the user from steering the agent (new prompts, interrupts,
+/// stops). It must NOT block the harness's own status notifications, or the user
+/// loses visibility into background work that is already running. `UserPromptSubmit`
+/// fires for both, so we distinguish by content: a `<task-notification>` is injected
+/// by the harness when a background process completes — it is progress to observe,
+/// not a prompt to gate. Let it through; gate everything the user actually typed.
+fn prompt_is_curfew_passthrough(prompt: &str) -> bool {
+    prompt.trim_start().starts_with("<task-notification>")
+}
+
+/// Read the `prompt` field from a `UserPromptSubmit` hook's stdin payload.
+/// Returns `None` when stdin is empty/unparseable so the caller fails closed
+/// (treats it as a real prompt and applies the curfew).
+fn hook_stdin_prompt() -> Option<String> {
+    let mut stdin = std::io::stdin();
+    // A TTY stdin has no piped payload; reading would block on EOF.
+    if stdin.is_terminal() {
+        return None;
+    }
+    let mut raw = String::new();
+    if stdin.read_to_string(&mut raw).is_err() || raw.trim().is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("prompt")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_owned())
 }
 
 fn config_from_parts(
@@ -2767,6 +2801,13 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
             Ok(if status.allowed { 0 } else { 1 })
         }
         CommandKind::Hook { agent } => {
+            // Let the harness's own progress notifications through the curfew so the
+            // user can still watch background work; only gate what the user typed.
+            if let Some(prompt) = hook_stdin_prompt() {
+                if prompt_is_curfew_passthrough(&prompt) {
+                    return Ok(0);
+                }
+            }
             match core.hook_payload(&agent) {
                 Ok(Some(payload)) => println!("{}", payload),
                 Ok(None) => {}
@@ -3197,12 +3238,37 @@ fn focus_target_pid() -> i32 {
     0
 }
 
+/// `frontmost_window()` runs `CGWindowListCopyWindowInfo` — a cross-process query to
+/// the WindowServer that allocates a dict for every on-screen window. The event-tap
+/// callback blocks keystroke delivery until it returns, so calling this on every
+/// key-down adds that round-trip to typing latency during curfew. Cache it briefly,
+/// the same way `pid_tree_runs_agent` already caches `ps`. The TTL is short enough
+/// that a focus change is reflected within a couple of keystrokes (and far too short
+/// to type and submit a prompt through a stale window), so the fail-safe direction is
+/// preserved while collapsing key-repeat/burst typing onto one query.
+#[cfg(target_os = "macos")]
+fn cached_frontmost_window() -> Option<macos_front_window::WindowInfo> {
+    static CACHE: Mutex<Option<(Instant, Option<macos_front_window::WindowInfo>)>> =
+        Mutex::new(None);
+    let mut guard = match CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let fresh = guard
+        .as_ref()
+        .is_some_and(|(stamp, _)| stamp.elapsed() < StdDuration::from_millis(50));
+    if !fresh {
+        *guard = Some((Instant::now(), macos_front_window::frontmost_window()));
+    }
+    guard.as_ref().and_then(|(_, window)| window.clone())
+}
+
 /// True if the focused window is a Codex/Claude prompt target. Called live in the
 /// event-tap callback: a fast title/owner check (no `ps`), plus the cheap
 /// process-tree result the poll thread precomputed for this PID.
 #[cfg(target_os = "macos")]
 fn current_window_is_target() -> bool {
-    let Some(window) = macos_front_window::frontmost_window() else {
+    let Some(window) = cached_frontmost_window() else {
         return false;
     };
     if window_is_agent_target(&window.owner, &window.title) {
@@ -5913,6 +5979,24 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_notifications_bypass_curfew_but_prompts_dont() {
+        // Harness progress notifications pass through so the user keeps visibility.
+        assert!(prompt_is_curfew_passthrough(
+            "<task-notification>\n<status>completed</status>\n</task-notification>"
+        ));
+        // Leading whitespace (the harness pretty-prints) still matches.
+        assert!(prompt_is_curfew_passthrough(
+            "  \n<task-notification></task-notification>"
+        ));
+        // Anything the user actually typed is still gated by the curfew.
+        assert!(!prompt_is_curfew_passthrough("please refactor this"));
+        assert!(!prompt_is_curfew_passthrough(
+            "stop the running build <task-notification>"
+        ));
+        assert!(!prompt_is_curfew_passthrough(""));
+    }
 
     #[test]
     fn window_draft_builds_cli_value() {
