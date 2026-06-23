@@ -373,8 +373,13 @@ fn normalized_hook_agent(agent: &str) -> Result<&'static str, String> {
 /// fires for both, so we distinguish by content: a `<task-notification>` is injected
 /// by the harness when a background process completes — it is progress to observe,
 /// not a prompt to gate. Let it through; gate everything the user actually typed.
+///
+/// Require the trimmed prompt to be *only* a notification block — open AND close tag —
+/// so a user under curfew can't bypass the gate by typing `<task-notification>` and
+/// then appending real instructions (a prefix-only match would let that through).
 fn prompt_is_curfew_passthrough(prompt: &str) -> bool {
-    prompt.trim_start().starts_with("<task-notification>")
+    let p = prompt.trim();
+    p.starts_with("<task-notification>") && p.ends_with("</task-notification>")
 }
 
 /// Read the `prompt` field from a `UserPromptSubmit` hook's stdin payload.
@@ -2803,10 +2808,10 @@ fn run_cli(command: CommandKind, core: &ParoleCore) -> Result<i32, String> {
         CommandKind::Hook { agent } => {
             // Let the harness's own progress notifications through the curfew so the
             // user can still watch background work; only gate what the user typed.
-            if let Some(prompt) = hook_stdin_prompt() {
-                if prompt_is_curfew_passthrough(&prompt) {
-                    return Ok(0);
-                }
+            if let Some(prompt) = hook_stdin_prompt()
+                && prompt_is_curfew_passthrough(&prompt)
+            {
+                return Ok(0);
             }
             match core.hook_payload(&agent) {
                 Ok(Some(payload)) => println!("{}", payload),
@@ -5228,7 +5233,55 @@ impl RawTerminalMode {
         if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // Drop restores the terminal on normal exit and panics, but NOT when the
+        // process is killed by a signal (Ctrl-C is delivered as bytes in raw mode, but
+        // an external SIGTERM, or SIGHUP when the terminal window closes, would skip
+        // Drop and leave the user's terminal in raw mode — no echo). Arm a handler that
+        // restores the saved termios and re-raises with the default disposition.
+        install_terminal_restore_signal_handlers(fd, original);
         Ok(Self { fd, original })
+    }
+}
+
+/// Saved (fd, original termios) published for the signal handler. Written once before
+/// any handler is installed and only read afterward, so the handler needs no lock.
+#[cfg(unix)]
+static SAVED_TERMIOS: OnceLock<(libc::c_int, libc::termios)> = OnceLock::new();
+
+/// Async-signal-safe terminal restore: an atomic load plus `tcsetattr`, then re-raise.
+#[cfg(unix)]
+extern "C" fn restore_terminal_on_signal(signum: libc::c_int) {
+    if let Some((fd, original)) = SAVED_TERMIOS.get() {
+        // SAFETY: `original` was captured from `fd` by tcgetattr; tcsetattr is
+        // async-signal-safe.
+        unsafe {
+            libc::tcsetattr(*fd, libc::TCSAFLUSH, original);
+        }
+    }
+    // Restore the default disposition and re-raise so the process terminates with the
+    // correct "killed by signal" status, as if we had never intercepted it.
+    unsafe {
+        libc::signal(signum, libc::SIG_DFL);
+        libc::raise(signum);
+    }
+}
+
+#[cfg(unix)]
+fn install_terminal_restore_signal_handlers(fd: libc::c_int, original: libc::termios) {
+    // Publish the termios for the handler BEFORE arming it. If a proxy already ran in
+    // this process, keep the first capture (it is the same stdin).
+    let _ = SAVED_TERMIOS.set((fd, original));
+    // SAFETY: the handler performs only async-signal-safe work; the sigaction struct is
+    // zero-initialized and fully populated before use.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction =
+            restore_terminal_on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
     }
 }
 
@@ -5996,6 +6049,12 @@ mod tests {
             "stop the running build <task-notification>"
         ));
         assert!(!prompt_is_curfew_passthrough(""));
+        // The bypass attempt: open the tag, then append real instructions. Rejected
+        // because it no longer ends with the closing tag.
+        assert!(!prompt_is_curfew_passthrough(
+            "<task-notification></task-notification> now refactor auth.rs and run tests"
+        ));
+        assert!(!prompt_is_curfew_passthrough("<task-notification>do the thing"));
     }
 
     #[test]
